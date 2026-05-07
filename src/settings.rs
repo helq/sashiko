@@ -183,12 +183,36 @@ pub struct AiSettings {
     /// Useful for debugging but verbose; disabled by default.
     #[serde(default)]
     pub log_turns: bool,
+    #[serde(default = "default_global_backoff")]
+    pub global_backoff: bool,
+    #[serde(default = "default_quota_backoff_secs")]
+    pub quota_backoff_secs: u64,
+    #[serde(default = "default_transient_backoff_type")]
+    pub transient_backoff_type: String,
+    #[serde(default = "default_transient_flat_backoff_secs")]
+    pub transient_flat_backoff_secs: u64,
     // Provider-specific settings
     pub claude: Option<ClaudeSettings>,
     pub gemini: Option<GeminiSettings>,
     #[cfg(feature = "bedrock")]
     pub bedrock: Option<BedrockSettings>,
     pub openai_compat: Option<OpenAiCompatSettings>,
+}
+
+fn default_global_backoff() -> bool {
+    true
+}
+
+fn default_quota_backoff_secs() -> u64 {
+    60
+}
+
+fn default_transient_backoff_type() -> String {
+    "exponential".to_string()
+}
+
+fn default_transient_flat_backoff_secs() -> u64 {
+    30
 }
 
 fn default_api_timeout_secs() -> u64 {
