@@ -165,6 +165,16 @@ pub struct ProviderCapabilities {
     pub context_window_size: usize,
 }
 
+#[derive(Debug, thiserror::Error, Clone)]
+pub enum AiError {
+    #[error("Quota exceeded: retry after {0:?}")]
+    QuotaExceeded(std::time::Duration),
+    #[error("Transient error: {1}, retry after {0:?}")]
+    Transient(std::time::Duration, String),
+    #[error("Fatal AI error: {0}")]
+    Fatal(String),
+}
+
 /// Trait defining the standard interface for all AI providers in Sashiko.
 #[async_trait]
 pub trait AiProvider: Send + Sync {
