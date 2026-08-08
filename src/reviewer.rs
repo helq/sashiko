@@ -821,6 +821,28 @@ impl Reviewer {
                             .args(["fetch", mainline_remote, sha_str])
                             .output()
                             .await;
+
+                        // Also try all other configured git remotes dynamically
+                        if let Ok(output) = Command::new("git")
+                            .current_dir(&repo_path)
+                            .args(["remote"])
+                            .output()
+                            .await
+                            && output.status.success()
+                        {
+                            let remotes_str = String::from_utf8_lossy(&output.stdout);
+                            for remote in remotes_str.lines() {
+                                let remote = remote.trim();
+                                if !remote.is_empty() && remote != "origin" {
+                                    let _ = Command::new("git")
+                                        .current_dir(&repo_path)
+                                        .args(["fetch", remote, sha_str])
+                                        .output()
+                                        .await;
+                                }
+                            }
+                        }
+
                         // Retry resolving
                         match get_commit_hash(&repo_path, &baseline_ref).await {
                             Ok(sha) => sha,
