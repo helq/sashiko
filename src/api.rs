@@ -83,13 +83,15 @@ impl<T: Clone> AsyncCache<T> {
 struct AsyncMapCache<K, V> {
     inner: RwLock<std::collections::HashMap<K, CachedValue<V>>>,
     ttl: Duration,
+    max_capacity: usize,
 }
 
 impl<K: std::hash::Hash + Eq + Clone, V: Clone> AsyncMapCache<K, V> {
-    fn new(ttl: Duration) -> Self {
+    fn new(ttl: Duration, max_capacity: usize) -> Self {
         Self {
             inner: RwLock::new(std::collections::HashMap::new()),
             ttl,
+            max_capacity,
         }
     }
 
@@ -112,6 +114,20 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> AsyncMapCache<K, V> {
         }
 
         let value = fetch().await?;
+
+        if write_guard.len() >= self.max_capacity {
+            let ttl = self.ttl;
+            write_guard.retain(|_, v| v.timestamp.elapsed() < ttl);
+            if write_guard.len() >= self.max_capacity
+                && let Some(oldest_key) = write_guard
+                    .iter()
+                    .min_by_key(|(_, v)| v.timestamp)
+                    .map(|(k, _)| k.clone())
+            {
+                write_guard.remove(&oldest_key);
+            }
+        }
+
         write_guard.insert(
             key,
             CachedValue {
@@ -334,6 +350,8 @@ pub struct RerunPatchQuery {
 #[derive(Deserialize)]
 pub struct SubsystemQuery {
     pub subsystem_id: Option<i64>,
+    #[serde(default)]
+    pub nocache: bool,
 }
 
 #[derive(Deserialize)]
@@ -425,14 +443,14 @@ pub fn build_router(
         dry_run: options.dry_run,
         local_token: options.local_token,
         sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
-        stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
+        stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60), 500),
         stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
         stats_tools_cache: AsyncCache::new(Duration::from_secs(60)),
         messages_count_cache: AsyncCache::new(Duration::from_secs(30)),
         patchsets_count_cache: AsyncCache::new(Duration::from_secs(30)),
         patchsets_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
         messages_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
-        bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(5)),
+        bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(5), 500),
     });
 
     Router::new()
@@ -1640,19 +1658,30 @@ async fn stats_timeline(
     State(state): State<Arc<AppState>>,
     Query(params): Query<SubsystemQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let data = state
-        .stats_timeline_cache
-        .get_or_fetch(params.subsystem_id, || async {
-            state
-                .db
-                .get_timeline_stats(params.subsystem_id)
-                .await
-                .map_err(|e| {
-                    info!("Error getting timeline stats: {}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })
-        })
-        .await?;
+    let data = if params.nocache {
+        state
+            .db
+            .get_timeline_stats(params.subsystem_id)
+            .await
+            .map_err(|e| {
+                info!("Error getting timeline stats: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+    } else {
+        state
+            .stats_timeline_cache
+            .get_or_fetch(params.subsystem_id, || async {
+                state
+                    .db
+                    .get_timeline_stats(params.subsystem_id)
+                    .await
+                    .map_err(|e| {
+                        info!("Error getting timeline stats: {}", e);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })
+            })
+            .await?
+    };
     Ok(Json(data))
 }
 
@@ -3301,14 +3330,14 @@ mod tests {
             dry_run: true,
             local_token: None,
             sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
-            stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
+            stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60), 500),
             stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
             stats_tools_cache: AsyncCache::new(Duration::from_secs(60)),
             messages_count_cache: AsyncCache::new(Duration::from_secs(30)),
             patchsets_count_cache: AsyncCache::new(Duration::from_secs(30)),
             patchsets_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
             messages_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
-            bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(5)),
+            bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(5), 500),
         });
 
         let blocked_user = crate::auth::AuthUser::new("blocked@example.com");
@@ -3682,14 +3711,14 @@ mod tests {
                 dry_run: true,
                 local_token: None,
                 sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
-                stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
+                stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60), 500),
                 stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
                 stats_tools_cache: AsyncCache::new(Duration::from_secs(60)),
                 messages_count_cache: AsyncCache::new(Duration::from_secs(30)),
                 patchsets_count_cache: AsyncCache::new(Duration::from_secs(30)),
                 patchsets_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
                 messages_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
-                bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(5)),
+                bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(5), 500),
             })
         };
 
@@ -3745,14 +3774,14 @@ mod tests {
                 dry_run: true,
                 local_token,
                 sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
-                stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
+                stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60), 500),
                 stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
                 stats_tools_cache: AsyncCache::new(Duration::from_secs(60)),
                 messages_count_cache: AsyncCache::new(Duration::from_secs(30)),
                 patchsets_count_cache: AsyncCache::new(Duration::from_secs(30)),
                 patchsets_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
                 messages_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
-                bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(5)),
+                bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(5), 500),
             })
         };
 
@@ -3874,14 +3903,14 @@ mod tests {
             dry_run: true,
             forge_registry: Arc::new(crate::forge::ForgeRegistry::new()),
             sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
-            stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
+            stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60), 500),
             stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
             stats_tools_cache: AsyncCache::new(Duration::from_secs(60)),
             messages_count_cache: AsyncCache::new(Duration::from_secs(30)),
             patchsets_count_cache: AsyncCache::new(Duration::from_secs(30)),
             patchsets_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
             messages_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
-            bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(5)),
+            bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(5), 500),
             local_token: None,
         });
         let index = crate::maintainers::MaintainersIndex::from_reader(
@@ -4161,6 +4190,78 @@ F:	net/
             &acl,
             Some(&index)
         ));
+    }
+
+    #[tokio::test]
+    async fn test_async_map_cache_caching_and_ttl() {
+        let cache = AsyncMapCache::new(Duration::from_millis(50), 10);
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let c1 = call_count.clone();
+        let val1 = cache
+            .get_or_fetch(Some(1), || async {
+                c1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, ()>("result_1")
+            })
+            .await
+            .unwrap();
+        assert_eq!(val1, "result_1");
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Immediate second call should hit cache without calling fetch
+        let c2 = call_count.clone();
+        let val2 = cache
+            .get_or_fetch(Some(1), || async {
+                c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, ()>("result_1_new")
+            })
+            .await
+            .unwrap();
+        assert_eq!(val2, "result_1");
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Wait for TTL to expire
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let c3 = call_count.clone();
+        let val3 = cache
+            .get_or_fetch(Some(1), || async {
+                c3.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, ()>("result_1_updated")
+            })
+            .await
+            .unwrap();
+        assert_eq!(val3, "result_1_updated");
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_async_map_cache_capacity_bounding() {
+        let max_capacity = 3;
+        let cache = AsyncMapCache::new(Duration::from_secs(60), max_capacity);
+
+        for i in 0..5 {
+            let _ = cache
+                .get_or_fetch(Some(i), || async { Ok::<_, ()>(format!("val_{}", i)) })
+                .await
+                .unwrap();
+        }
+
+        let guard = cache.inner.read().await;
+        assert!(guard.len() <= max_capacity);
+    }
+
+    #[test]
+    fn test_subsystem_query_deserialization() {
+        let json_default = serde_json::json!({});
+        let query: SubsystemQuery = serde_json::from_value(json_default).unwrap();
+        assert_eq!(query.subsystem_id, None);
+        assert!(!query.nocache);
+
+        let json_nocache = serde_json::json!({"subsystem_id": 42, "nocache": true});
+        let query_nocache: SubsystemQuery = serde_json::from_value(json_nocache).unwrap();
+        assert_eq!(query_nocache.subsystem_id, Some(42));
+        assert!(query_nocache.nocache);
     }
 }
 
