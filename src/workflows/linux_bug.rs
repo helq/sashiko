@@ -2241,10 +2241,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_verify_session_false_positive_early_exit() {
-        let db_settings = crate::settings::DatabaseSettings {
-            url: ":memory:".to_string(),
-            token: String::new(),
-        };
+        let db_settings = crate::settings::DatabaseSettings::memory();
         let db = Database::new(&db_settings).await.unwrap();
         db.migrate().await.unwrap();
 
@@ -2646,12 +2643,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_bug_completed_stage_survives_later_failure() {
-        let db = Database::new(&crate::settings::DatabaseSettings {
-            url: ":memory:".into(),
-            token: String::new(),
-        })
-        .await
-        .unwrap();
+        let db = Database::new(&crate::settings::DatabaseSettings::memory())
+            .await
+            .unwrap();
         db.migrate().await.unwrap();
         let provider = QueuedMockAiProvider::new(vec![
             json!({
@@ -2938,10 +2932,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_issue_flow() {
-        let db_settings = crate::settings::DatabaseSettings {
-            url: ":memory:".to_string(),
-            token: String::new(),
-        };
+        let db_settings = crate::settings::DatabaseSettings::memory();
         let db = Database::new(&db_settings).await.unwrap();
         db.migrate().await.unwrap();
 
@@ -3066,10 +3057,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_issue_duplicate_after_verification_aborts_db_write() {
-        let db_settings = crate::settings::DatabaseSettings {
-            url: ":memory:".to_string(),
-            token: String::new(),
-        };
+        let db_settings = crate::settings::DatabaseSettings::memory();
         let db = Database::new(&db_settings).await.unwrap();
         db.migrate().await.unwrap();
 

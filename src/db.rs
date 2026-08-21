@@ -7830,11 +7830,7 @@ mod tests {
     /// functional test because the answer stays correct either way.
     #[tokio::test]
     async fn test_patch_msgid_lookup_uses_an_index() -> Result<()> {
-        let db = Database::new(&DatabaseSettings {
-            url: ":memory:".into(),
-            token: String::new(),
-        })
-        .await?;
+        let db = Database::new(&DatabaseSettings::memory()).await?;
         db.migrate().await?;
 
         let plan: String = db
@@ -7864,11 +7860,7 @@ mod tests {
     /// schema is immediately usable.
     #[tokio::test]
     async fn test_bug_schema_migrates_and_is_usable() -> Result<()> {
-        let db = Database::new(&DatabaseSettings {
-            url: ":memory:".into(),
-            token: String::new(),
-        })
-        .await?;
+        let db = Database::new(&DatabaseSettings::memory()).await?;
 
         db.migrate().await?;
         // Re-running must be a no-op rather than recreating anything.
@@ -8708,10 +8700,7 @@ mod tests {
     use std::sync::Arc;
 
     async fn setup_db() -> Arc<Database> {
-        let settings = DatabaseSettings {
-            url: ":memory:".to_string(),
-            token: String::new(),
-        };
+        let settings = DatabaseSettings::memory();
         let db = Database::new(&settings).await.unwrap();
         db.migrate().await.unwrap();
         Arc::new(db)
@@ -14287,15 +14276,9 @@ mod tests {
         assert_eq!(det_final["status"], "Pending");
     }
 
-    /// Verify that an existing database at user_version = 1 with the legacy
-    /// UNIQUE(message_id) constraint is automatically migrated by db.migrate()
-    /// without requiring a user_version bump.
     #[tokio::test]
     async fn test_bug_crud_and_links() {
-        let db_settings = crate::settings::DatabaseSettings {
-            url: ":memory:".to_string(),
-            token: String::new(),
-        };
+        let db_settings = crate::settings::DatabaseSettings::memory();
         let db = Database::new(&db_settings).await.unwrap();
         db.migrate().await.unwrap();
 
@@ -14679,10 +14662,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_migration_retires_folded_bugs_left_in_the_pipeline() {
-        let db_settings = crate::settings::DatabaseSettings {
-            url: ":memory:".to_string(),
-            token: String::new(),
-        };
+        let db_settings = crate::settings::DatabaseSettings::memory();
         let db = Database::new(&db_settings).await.unwrap();
         db.migrate().await.unwrap();
 
@@ -14732,10 +14712,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_recover_stale_running_bugs() {
-        let db_settings = crate::settings::DatabaseSettings {
-            url: ":memory:".to_string(),
-            token: String::new(),
-        };
+        let db_settings = crate::settings::DatabaseSettings::memory();
         let db = Database::new(&db_settings).await.unwrap();
         db.migrate().await.unwrap();
 
@@ -14793,10 +14770,7 @@ mod tests {
     /// can match, and the bug is stranded for good.
     #[tokio::test]
     async fn test_mark_duplicate_retires_running_pipeline() {
-        let db_settings = crate::settings::DatabaseSettings {
-            url: ":memory:".to_string(),
-            token: String::new(),
-        };
+        let db_settings = crate::settings::DatabaseSettings::memory();
         let db = Database::new(&db_settings).await.unwrap();
         db.migrate().await.unwrap();
 
@@ -14858,10 +14832,7 @@ mod tests {
     /// only against expiry leaves such a row running for good.
     #[tokio::test]
     async fn test_recovery_reclaims_running_bug_with_no_lease() {
-        let db_settings = crate::settings::DatabaseSettings {
-            url: ":memory:".to_string(),
-            token: String::new(),
-        };
+        let db_settings = crate::settings::DatabaseSettings::memory();
         let db = Database::new(&db_settings).await.unwrap();
         db.migrate().await.unwrap();
 
@@ -14918,10 +14889,7 @@ mod tests {
     /// rediscover a finding that already lives on the canonical bug.
     #[tokio::test]
     async fn test_claim_skips_folded_bugs() {
-        let db_settings = crate::settings::DatabaseSettings {
-            url: ":memory:".to_string(),
-            token: String::new(),
-        };
+        let db_settings = crate::settings::DatabaseSettings::memory();
         let db = Database::new(&db_settings).await.unwrap();
         db.migrate().await.unwrap();
 
@@ -14953,12 +14921,9 @@ mod tests {
 
     #[tokio::test]
     async fn failed_outcome_write_rolls_back_every_result_and_remains_recoverable() {
-        let db = Database::new(&crate::settings::DatabaseSettings {
-            url: ":memory:".into(),
-            token: String::new(),
-        })
-        .await
-        .unwrap();
+        let db = Database::new(&crate::settings::DatabaseSettings::memory())
+            .await
+            .unwrap();
         db.migrate().await.unwrap();
         let id = create_pending_bug(&db, "linux-atomic-result").await;
         db.claim_pending_bug("worker", 300, 3).await.unwrap();
@@ -15044,12 +15009,9 @@ mod tests {
             BugLifecycleStatus::Duplicate,
         ] {
             for verdict in [BugLifecycleStatus::Open, BugLifecycleStatus::Dismissed] {
-                let db = Database::new(&crate::settings::DatabaseSettings {
-                    url: ":memory:".into(),
-                    token: String::new(),
-                })
-                .await
-                .unwrap();
+                let db = Database::new(&crate::settings::DatabaseSettings::memory())
+                    .await
+                    .unwrap();
                 db.migrate().await.unwrap();
                 let id = create_pending_bug(&db, "linux-triaged").await;
                 let canonical = create_pending_bug(&db, "linux-canonical").await;
@@ -15120,14 +15082,14 @@ mod tests {
     #[tokio::test]
     async fn stale_analysis_cannot_write_or_clear_a_replacement_lease() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let settings = crate::settings::DatabaseSettings {
-            url: directory
+        let settings = crate::settings::DatabaseSettings::new(
+            directory
                 .path()
                 .join("lease.db")
                 .to_string_lossy()
                 .into_owned(),
-            token: String::new(),
-        };
+            String::new(),
+        );
         let db = Database::new(&settings).await?;
         db.migrate().await?;
         let replacement_db = Database::new(&settings).await?;
@@ -15281,11 +15243,7 @@ mod tests {
 
     #[tokio::test]
     async fn automatic_duplicate_keeps_its_claim_until_linking_finishes() -> Result<()> {
-        let db = Database::new(&crate::settings::DatabaseSettings {
-            url: ":memory:".into(),
-            token: String::new(),
-        })
-        .await?;
+        let db = Database::new(&crate::settings::DatabaseSettings::memory()).await?;
         db.migrate().await?;
         let id = create_pending_bug(&db, "linux-owned-duplicate").await;
         let canonical = create_pending_bug(&db, "linux-owned-canonical").await;
@@ -15346,10 +15304,7 @@ mod tests {
     /// and has to refuse once the claim belongs to somebody else.
     #[tokio::test]
     async fn test_renew_bug_lease_holds_and_detects_takeover() {
-        let db_settings = crate::settings::DatabaseSettings {
-            url: ":memory:".to_string(),
-            token: String::new(),
-        };
+        let db_settings = crate::settings::DatabaseSettings::memory();
         let db = Database::new(&db_settings).await.unwrap();
         db.migrate().await.unwrap();
 
@@ -15409,10 +15364,7 @@ mod tests {
     /// discovered it in the first place.
     #[tokio::test]
     async fn test_link_review_to_bug_never_downgrades_discovery() {
-        let db_settings = crate::settings::DatabaseSettings {
-            url: ":memory:".to_string(),
-            token: String::new(),
-        };
+        let db_settings = crate::settings::DatabaseSettings::memory();
         let db = Database::new(&db_settings).await.unwrap();
         db.migrate().await.unwrap();
 
@@ -15494,10 +15446,7 @@ mod tests {
     /// assigned_at to be present exactly when there is an assignee.
     #[tokio::test]
     async fn test_assign_and_unassign_bug() {
-        let db_settings = crate::settings::DatabaseSettings {
-            url: ":memory:".to_string(),
-            token: String::new(),
-        };
+        let db_settings = crate::settings::DatabaseSettings::memory();
         let db = Database::new(&db_settings).await.unwrap();
         db.migrate().await.unwrap();
 
@@ -15553,10 +15502,7 @@ mod tests {
     /// "nobody has picked this up yet".
     #[tokio::test]
     async fn test_list_bugs_by_assignee() {
-        let db_settings = crate::settings::DatabaseSettings {
-            url: ":memory:".to_string(),
-            token: String::new(),
-        };
+        let db_settings = crate::settings::DatabaseSettings::memory();
         let db = Database::new(&db_settings).await.unwrap();
         db.migrate().await.unwrap();
 
@@ -15598,10 +15544,7 @@ mod tests {
     /// like work that is about to happen.
     #[tokio::test]
     async fn test_bug_analysis_retry_cap_and_dead_letter() {
-        let db_settings = crate::settings::DatabaseSettings {
-            url: ":memory:".to_string(),
-            token: String::new(),
-        };
+        let db_settings = crate::settings::DatabaseSettings::memory();
         let db = Database::new(&db_settings).await.unwrap();
         db.migrate().await.unwrap();
 
@@ -15648,10 +15591,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bug_enrichments_multi_tool_timeline() {
-        let db_settings = crate::settings::DatabaseSettings {
-            url: ":memory:".to_string(),
-            token: String::new(),
-        };
+        let db_settings = crate::settings::DatabaseSettings::memory();
         let db = Database::new(&db_settings).await.unwrap();
         db.migrate().await.unwrap();
 

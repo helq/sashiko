@@ -2393,10 +2393,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_local_token_authorizes_ingest_but_grants_no_identity() {
-        let db_settings = crate::settings::DatabaseSettings {
-            url: ":memory:".to_string(),
-            token: String::new(),
-        };
+        let db_settings = crate::settings::DatabaseSettings::memory();
         let db = Arc::new(Database::new(&db_settings).await.unwrap());
         db.migrate().await.unwrap();
 
@@ -2491,10 +2488,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bug_input_endpoint_serves_per_bug_payload() {
-        let db_settings = crate::settings::DatabaseSettings {
-            url: ":memory:".to_string(),
-            token: String::new(),
-        };
+        let db_settings = crate::settings::DatabaseSettings::memory();
         let db = Arc::new(Database::new(&db_settings).await.unwrap());
         db.migrate().await.unwrap();
 
@@ -2620,10 +2614,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bug_endpoints() {
-        let db_settings = crate::settings::DatabaseSettings {
-            url: ":memory:".to_string(),
-            token: String::new(),
-        };
+        let db_settings = crate::settings::DatabaseSettings::memory();
         let db = Arc::new(Database::new(&db_settings).await.unwrap());
         db.migrate().await.unwrap();
 
@@ -3127,10 +3118,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_acl_blocklist_authorization_and_auth_endpoints() {
-        let db_settings = crate::settings::DatabaseSettings {
-            url: ":memory:".to_string(),
-            token: String::new(),
-        };
+        let db_settings = crate::settings::DatabaseSettings::memory();
         let db = Arc::new(Database::new(&db_settings).await.unwrap());
         db.migrate().await.unwrap();
 
@@ -3350,10 +3338,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sign_in_link_email_delivery_and_logging() {
-        let db_settings = crate::settings::DatabaseSettings {
-            url: ":memory:".to_string(),
-            token: String::new(),
-        };
+        let db_settings = crate::settings::DatabaseSettings::memory();
         let db = Arc::new(Database::new(&db_settings).await.unwrap());
         db.migrate().await.unwrap();
 
@@ -3431,10 +3416,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_request_link_unconditional_response_equivalence() {
-        let db_settings = crate::settings::DatabaseSettings {
-            url: ":memory:".to_string(),
-            token: String::new(),
-        };
+        let db_settings = crate::settings::DatabaseSettings::memory();
         let db = Arc::new(Database::new(&db_settings).await.unwrap());
         db.migrate().await.unwrap();
 
@@ -3594,10 +3576,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_request_link_rate_limiting_suppresses_mail_but_returns_200() {
-        let db_settings = crate::settings::DatabaseSettings {
-            url: ":memory:".to_string(),
-            token: String::new(),
-        };
+        let db_settings = crate::settings::DatabaseSettings::memory();
         let db = Arc::new(Database::new(&db_settings).await.unwrap());
         db.migrate().await.unwrap();
 
@@ -3677,10 +3656,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_blocklist_outranks_every_bypass() {
-        let db_settings = crate::settings::DatabaseSettings {
-            url: ":memory:".to_string(),
-            token: String::new(),
-        };
+        let db_settings = crate::settings::DatabaseSettings::memory();
         let db = Arc::new(Database::new(&db_settings).await.unwrap());
         db.migrate().await.unwrap();
 
@@ -3748,10 +3724,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_loopback_grants_nothing_without_the_token() {
-        let db_settings = crate::settings::DatabaseSettings {
-            url: ":memory:".to_string(),
-            token: String::new(),
-        };
+        let db_settings = crate::settings::DatabaseSettings::memory();
         let db = Arc::new(Database::new(&db_settings).await.unwrap());
         db.migrate().await.unwrap();
 
@@ -3845,12 +3818,9 @@ mod tests {
     #[tokio::test]
     async fn bug_evidence_excludes_inaccessible_family_members() {
         let db = Arc::new(
-            Database::new(&crate::settings::DatabaseSettings {
-                url: ":memory:".into(),
-                token: String::new(),
-            })
-            .await
-            .unwrap(),
+            Database::new(&crate::settings::DatabaseSettings::memory())
+                .await
+                .unwrap(),
         );
         db.migrate().await.unwrap();
         let mut ids = Vec::new();
@@ -3964,10 +3934,7 @@ mod tests {
 
     async fn test_bug_reads_require_an_authorized_principal() {
         const SECRET: &str = "bug-authz-secret-12345678901234567890";
-        let db_settings = crate::settings::DatabaseSettings {
-            url: ":memory:".to_string(),
-            token: String::new(),
-        };
+        let db_settings = crate::settings::DatabaseSettings::memory();
         let db = Arc::new(Database::new(&db_settings).await.unwrap());
         db.migrate().await.unwrap();
 

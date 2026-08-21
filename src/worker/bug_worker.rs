@@ -281,12 +281,9 @@ mod tests {
 
     #[tokio::test]
     async fn renewal_stops_at_the_last_confirmed_deadline() {
-        let db = Database::new(&crate::settings::DatabaseSettings {
-            url: ":memory:".into(),
-            token: String::new(),
-        })
-        .await
-        .unwrap();
+        let db = Database::new(&crate::settings::DatabaseSettings::memory())
+            .await
+            .unwrap();
         // No schema is needed: expiry must stop the renewal before its next
         // database request, rather than waiting another renewal interval.
         tokio::time::timeout(
