@@ -1346,7 +1346,9 @@ impl Database {
             crate::utils::redact_secret(&settings.url)
         );
 
-        let db = if settings.url.starts_with("libsql://") || settings.url.starts_with("https://") {
+        let is_remote =
+            settings.url.starts_with("libsql://") || settings.url.starts_with("https://");
+        let db = if is_remote {
             Builder::new_remote(settings.url.clone(), settings.token.clone())
                 .build()
                 .await?
@@ -1356,18 +1358,60 @@ impl Database {
 
         let conn = db.connect()?;
 
-        // Enable WAL mode for better concurrency
-        // PRAGMA journal_mode returns a row (the new mode), so we must use query() instead of execute()
-        let _ = conn
-            .query("PRAGMA journal_mode=WAL;", ())
-            .await?
-            .next()
-            .await;
-        let _ = conn
-            .query("PRAGMA busy_timeout = 5000;", ())
-            .await?
-            .next()
-            .await;
+        if !is_remote {
+            // Enable WAL mode for better concurrency
+            // PRAGMA journal_mode returns a row (the new mode), so we must use query() instead of execute()
+            let _ = conn
+                .query("PRAGMA journal_mode=WAL;", ())
+                .await?
+                .next()
+                .await;
+            let _ = conn
+                .query("PRAGMA busy_timeout = 5000;", ())
+                .await?
+                .next()
+                .await;
+
+            let sync_mode = match settings
+                .synchronous
+                .as_deref()
+                .unwrap_or("normal")
+                .to_lowercase()
+                .as_str()
+            {
+                "full" => "FULL",
+                "off" => "OFF",
+                "extra" => "EXTRA",
+                _ => "NORMAL",
+            };
+            let _ = conn
+                .query(&format!("PRAGMA synchronous = {};", sync_mode), ())
+                .await?
+                .next()
+                .await;
+
+            let cache_kb = settings.cache_size_kb.unwrap_or(65536);
+            let _ = conn
+                .query(&format!("PRAGMA cache_size = -{};", cache_kb.abs()), ())
+                .await?
+                .next()
+                .await;
+
+            let mmap_mb = settings.mmap_size_mb.unwrap_or(256);
+            let mmap_bytes = (mmap_mb as u64) * 1024 * 1024;
+            let _ = conn
+                .query(&format!("PRAGMA mmap_size = {};", mmap_bytes), ())
+                .await?
+                .next()
+                .await;
+
+            let _ = conn
+                .query("PRAGMA temp_store = MEMORY;", ())
+                .await?
+                .next()
+                .await;
+        }
+
         // Foreign keys are off by default in SQLite and must be re-enabled per
         // connection. Without this every ON DELETE CASCADE in the schema is
         // inert and orphaned child rows accumulate silently.
@@ -16693,10 +16737,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_project_stamp_idempotent_and_rejects_mismatch() {
-        let settings = crate::settings::DatabaseSettings {
-            url: ":memory:".to_string(),
-            token: String::new(),
-        };
+        let settings = crate::settings::DatabaseSettings::memory();
         let db = Database::new(&settings).await.unwrap();
         db.migrate().await.unwrap();
 
@@ -16722,10 +16763,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pull_request_commits_grouped_into_single_patchset_series() {
-        let settings = crate::settings::DatabaseSettings {
-            url: ":memory:".to_string(),
-            token: String::new(),
-        };
+        let settings = crate::settings::DatabaseSettings::memory();
         let db = Database::new(&settings).await.unwrap();
         db.migrate().await.unwrap();
 
@@ -16856,10 +16894,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pull_request_update_increments_version_and_rotates_slug() {
-        let settings = crate::settings::DatabaseSettings {
-            url: ":memory:".to_string(),
-            token: String::new(),
-        };
+        let settings = crate::settings::DatabaseSettings::memory();
         let db = Database::new(&settings).await.unwrap();
         db.migrate().await.unwrap();
         let mr_number = 513;
@@ -16964,5 +16999,22 @@ mod tests {
             rotated_v1["subject"].as_str(),
             Some("#513: baseline: route iwl-net and iwl-next series to dev-queue")
         );
+    }
+
+    #[tokio::test]
+    async fn test_database_pragmas_configured() {
+        let mut db_settings = crate::settings::DatabaseSettings::memory();
+        db_settings.synchronous = Some("normal".to_string());
+        db_settings.cache_size_kb = Some(32768);
+        db_settings.mmap_size_mb = Some(128);
+
+        let db = Database::new(&db_settings).await.unwrap();
+
+        let mut rows = db.conn.query("PRAGMA temp_store;", ()).await.unwrap();
+        if let Some(row) = rows.next().await.unwrap() {
+            let temp_store: i64 = row.get(0).unwrap();
+            // 2 corresponds to MEMORY
+            assert_eq!(temp_store, 2);
+        }
     }
 }
