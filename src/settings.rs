@@ -690,6 +690,12 @@ pub struct ServerSettings {
 
     #[serde(default)]
     pub acl: AclSettings,
+    #[serde(default = "default_tcp_backlog")]
+    pub tcp_backlog: u32,
+}
+
+fn default_tcp_backlog() -> u32 {
+    1024
 }
 
 impl ServerSettings {
@@ -717,7 +723,7 @@ fn is_reachable_base_url(url: &str) -> bool {
     };
     if !matches!(scheme, "http" | "https") {
         return false;
-    }
+    };
     let authority = rest.split('/').next().unwrap_or("");
     // An IPv6 literal is bracketed, so only a colon outside the brackets
     // separates the port.
@@ -1293,6 +1299,7 @@ mod tests {
             jwt_secret: None,
             log_sign_in_links: false,
             acl: AclSettings::default(),
+            tcp_backlog: 1024,
         };
         assert_eq!(server.sign_in_base_url(), "https://sashiko.example.org");
 

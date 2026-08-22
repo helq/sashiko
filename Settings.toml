@@ -160,6 +160,7 @@ prompt_caching = true
 [server]
 host = "::"
 port = 8080
+# tcp_backlog = 1024 # TCP listen backlog queue size (default: 1024)
 # The URL this service is reachable at from outside, with no trailing slash.
 # Required whenever [smtp] is configured, because sign-in links are mailed and
 # the bind address above does not name a host a recipient can open. The server
