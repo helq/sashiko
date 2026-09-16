@@ -175,6 +175,12 @@ impl<S: 'static, T: 'static> StageBuilder<S, T> {
         self
     }
 
+    /// Configures an optional suffix appended to the environment context tag for this stage.
+    pub fn context_tag_suffix(mut self, suffix: impl Into<String>) -> Self {
+        self.policy.context_tag_suffix = Some(suffix.into());
+        self
+    }
+
     /// Defines how the stage output `T` mutates the workflow state `&mut S`.
     pub fn reduce<F>(mut self, reducer: F) -> Self
     where
@@ -425,6 +431,17 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
         let log_user_prompt = self.user_prompt.render_for_log(state);
 
         let stage_name = self.name;
+        let context_tag = match (&env.context_tag, &self.policy.context_tag_suffix) {
+            (Some(prefix), Some(suffix)) => {
+                if let Some(stripped) = prefix.trim_end().strip_suffix(']') {
+                    Some(format!("{stripped} {suffix}] "))
+                } else {
+                    Some(format!("{prefix} {suffix}] "))
+                }
+            }
+            (Some(prefix), None) => Some(prefix.clone()),
+            (None, _) => None,
+        };
         let result = {
             let mut session = StageSession {
                 stage: self,
@@ -433,7 +450,7 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
                 system_prompt,
                 user_prompt,
                 log_user_prompt,
-                context_tag: env.context_tag.clone(),
+                context_tag,
                 recitation_fallback_active: false,
                 last_tool_call: None,
             };
@@ -846,5 +863,37 @@ mod tests {
             "the model should see the tool's error: {:?}",
             tool_reply.content
         );
+    }
+
+    #[tokio::test]
+    async fn test_context_tag_suffix_multibyte_utf8() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ToolCallingProvider {
+            turn: Mutex::new(0),
+            seen: Mutex::new(Vec::new()),
+            calls: Vec::new(),
+            calling_turns: 0,
+        });
+        let env = WorkflowEnv {
+            provider: provider.clone(),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            base_dir: tmp.path(),
+            context_tag: Some("[author:Søren—]".to_string()),
+        };
+
+        let stage: Stage<EmptyState, String> = Stage::builder("test_utf8")
+            .user_prompt(PromptTemplate::new("go"))
+            .output_format(OutputFormat::text())
+            .context_tag_suffix("s:1")
+            .reduce(|_: &mut EmptyState, _: String| {})
+            .build();
+
+        let (_outcome, _mutation) = stage
+            .execute_isolated(&env, &EmptyState, None)
+            .await
+            .unwrap();
+
+        let seen = provider.seen.lock().unwrap();
+        assert_eq!(seen[0].context_tag.as_deref(), Some("[author:Søren— s:1] "));
     }
 }
