@@ -135,6 +135,10 @@ impl WorkflowEngine {
                         break;
                     }
                 }
+
+                WorkflowStep::Step(f) => {
+                    f(state);
+                }
             }
         }
 
@@ -400,5 +404,54 @@ mod tests {
         assert!(!outcome.early_exit);
         // The plan is reported as resolved, not guessed from the stage list.
         assert_eq!(*resolved.lock().unwrap(), vec!["stage_4", "stage_5"]);
+    }
+
+    #[tokio::test]
+    async fn test_workflow_pure_rust_step_and_early_exit() {
+        let provider = Arc::new(MockProvider::single(r#"{"items": ["minor note"]}"#));
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = Arc::new(ToolBox::new(tmp.path().to_path_buf(), None));
+        let env = WorkflowEnv {
+            provider,
+            tools,
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let mut state = DummyState::default();
+
+        let workflow = Workflow::builder("step_flow")
+            .stage(
+                Stage::builder("stage_1")
+                    .user_prompt(PromptTemplate::new("Analyze"))
+                    .output_format(OutputFormat::json())
+                    .reduce(|s: &mut DummyState, out: DummyConcernsOutput| {
+                        s.concerns.extend(out.items);
+                    })
+                    .build(),
+            )
+            .step(|s: &mut DummyState| {
+                s.concerns.retain(|c| !c.contains("minor"));
+            })
+            .early_exit_if(|s| s.concerns.is_empty(), "filtered out all concerns")
+            .stage(
+                Stage::builder("stage_2")
+                    .user_prompt(PromptTemplate::new("Never reached"))
+                    .output_format(OutputFormat::json())
+                    .reduce(|s: &mut DummyState, out: DummyConcernsOutput| {
+                        s.findings.extend(out.items);
+                    })
+                    .build(),
+            )
+            .build();
+
+        let outcome = WorkflowEngine::execute(&workflow, &env, &mut state, None)
+            .await
+            .unwrap();
+
+        assert!(outcome.early_exit);
+        assert_eq!(outcome.early_exit_reason, Some("filtered out all concerns"));
+        assert!(state.concerns.is_empty());
+        assert!(state.findings.is_empty());
     }
 }
