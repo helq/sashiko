@@ -222,6 +222,7 @@ impl<'a> SessionRunner<'a> {
         let mut total_prompt_tokens = 0;
         let mut total_completion_tokens = 0;
         let mut total_cached_tokens = 0;
+        let mut final_turn_prompt_injected = false;
 
         loop {
             turns += 1;
@@ -233,13 +234,18 @@ impl<'a> SessionRunner<'a> {
             }
 
             let is_final_turn = turns == self.max_turns;
-            if is_final_turn && turns > 1 {
+            if is_final_turn && turns > 1 && !final_turn_prompt_injected {
+                final_turn_prompt_injected = true;
+                let verdict_instruction = if session.response_format().is_none() {
+                    "Synthesize your final verdict now based on the evidence gathered so far."
+                } else {
+                    "Synthesize your final JSON verdict now based on the evidence gathered so far."
+                };
                 let final_prompt = AiMessage {
                     role: AiRole::User,
-                    content: Some(
-                        "TURN BUDGET EXHAUSTED: You have reached the maximum allowed investigation turns. Do NOT call any tools. Synthesize your final JSON verdict now based on the evidence gathered so far."
-                            .to_string(),
-                    ),
+                    content: Some(format!(
+                        "TURN BUDGET EXHAUSTED: You have reached the maximum allowed investigation turns. Do NOT call any tools. {verdict_instruction}"
+                    )),
                     thought: None,
                     thought_signature: None,
                     tool_calls: None,
@@ -681,5 +687,73 @@ mod tests {
             .find(|m| m.role == AiRole::Assistant)
             .expect("retry request must contain previous assistant message");
         assert!(retry_assistant_msg.tool_calls.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_session_runner_guards_final_turn_prompt_injection_on_retry() {
+        let responses = vec![
+            // Turn 1: tool call
+            AiResponse {
+                content: None,
+                thought: None,
+                thought_signature: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    function_name: "ok_tool".to_string(),
+                    arguments: serde_json::json!({}),
+                    thought_signature: None,
+                }]),
+                usage: None,
+                truncated: false,
+            },
+            // Turn 2 (max turns): invalid output triggers validation retry
+            AiResponse {
+                content: Some("first attempt at final turn".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            },
+            // Turn 2 retry: valid output
+            AiResponse {
+                content: Some("second attempt at final turn".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            },
+        ];
+
+        let provider = MockProvider::new(responses);
+        let runner = SessionRunner::new(&provider).with_max_turns(2);
+        let mut session = RetryValidationSession {
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let res = runner.run(&mut session).await.unwrap();
+        assert_eq!(res.output, "second attempt at final turn");
+
+        // Verify "TURN BUDGET EXHAUSTED" was only injected once into history
+        let budget_messages: Vec<_> = res
+            .history
+            .iter()
+            .filter(|m| {
+                m.role == AiRole::User
+                    && m.content
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("TURN BUDGET EXHAUSTED")
+            })
+            .collect();
+        assert_eq!(budget_messages.len(), 1);
+
+        // Also check prompt text when response_format is None
+        assert!(
+            budget_messages[0].content.as_ref().unwrap().contains(
+                "Synthesize your final verdict now based on the evidence gathered so far."
+            )
+        );
     }
 }
