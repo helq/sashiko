@@ -442,6 +442,7 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
             (Some(prefix), None) => Some(prefix.clone()),
             (None, _) => None,
         };
+        let stage_history = std::sync::Mutex::new(Vec::new());
         let result = {
             let mut session = StageSession {
                 stage: self,
@@ -458,6 +459,7 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
             let runner = SessionRunner::new(env.provider.as_ref())
                 .with_max_turns(self.policy.max_turns)
                 .with_max_validation_attempts(self.policy.max_validation_attempts)
+                .with_log_buffer(&stage_history)
                 .with_turn_callback(move |turn, max_turns| {
                     if let Some(cb) = event_cb {
                         cb(WorkflowEvent::StageTurn {
