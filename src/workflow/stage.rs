@@ -258,6 +258,9 @@ impl<'a, S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> LlmSess
     }
 
     fn tools(&self) -> Option<Vec<AiTool>> {
+        if self.recitation_fallback_active {
+            return None;
+        }
         match &self.stage.policy.tools {
             ToolScope::None => None,
             ToolScope::All => Some(self.tools.get_declarations_generic()),
@@ -359,6 +362,20 @@ impl<'a, S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> LlmSess
 
     fn validate(&mut self, response: &AiResponse) -> Result<Self::Output, ValidationError> {
         let text = response.content.as_deref().unwrap_or("");
+        if self.recitation_fallback_active
+            && matches!(self.stage.output_format, OutputFormat::Text { .. })
+        {
+            if text.trim().is_empty() {
+                return Err(ValidationError::FormatViolation(
+                    "Free-form recitation fallback response cannot be empty.".to_string(),
+                ));
+            }
+            return self
+                .stage
+                .output_format
+                .validate(text, self.state)
+                .map_err(ValidationError::FormatViolation);
+        }
         match self.stage.output_format.validate(text, self.state) {
             Ok(parsed) => Ok(parsed),
             Err(violation) => Err(ValidationError::FormatViolation(violation)),
@@ -897,5 +914,92 @@ mod tests {
 
         let seen = provider.seen.lock().unwrap();
         assert_eq!(seen[0].context_tag.as_deref(), Some("[author:Søren— s:1] "));
+    }
+
+    #[tokio::test]
+    async fn test_recitation_fallback_to_free_form_validates_text_and_disables_tools() {
+        struct RecitationProvider {
+            turn: Mutex<usize>,
+            tools_seen: Mutex<Vec<Option<Vec<AiTool>>>>,
+        }
+
+        #[async_trait]
+        impl AiProvider for RecitationProvider {
+            async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+                self.tools_seen.lock().unwrap().push(request.tools);
+                let mut turn = self.turn.lock().unwrap();
+                *turn += 1;
+                if *turn == 1 {
+                    anyhow::bail!("Generation blocked due to RECITATION");
+                }
+                Ok(AiResponse {
+                    content: Some("Valid free-form summary".to_string()),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    usage: None,
+                    truncated: false,
+                })
+            }
+
+            fn get_capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities {
+                    model_name: "mock".to_string(),
+                    context_window_size: 100_000,
+                }
+            }
+        }
+
+        #[derive(Default, Clone)]
+        struct OutputState(String);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(RecitationProvider {
+            turn: Mutex::new(0),
+            tools_seen: Mutex::new(Vec::new()),
+        });
+        let env = WorkflowEnv {
+            provider: provider.clone(),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let stage: Stage<OutputState, String> = Stage::builder("recitation_text_stage")
+            .user_prompt(PromptTemplate::new("review patch"))
+            .tools(ToolScope::All)
+            .output_format(OutputFormat::text_with_validator(
+                |text, _| {
+                    if text.contains("Valid") {
+                        Ok(())
+                    } else {
+                        Err("Output must contain 'Valid'".to_string())
+                    }
+                },
+                |v| format!("Validation failed: {v}"),
+            ))
+            .on_recitation(RecitationPolicy::FallbackToFreeForm {
+                reminder: "Rewrite in free-form without quoting.".to_string(),
+            })
+            .reduce(|state: &mut OutputState, out: String| {
+                state.0 = out;
+            })
+            .build();
+
+        let mut state = OutputState::default();
+        let outcome = stage
+            .execute(&env, &mut state, None)
+            .await
+            .expect("recitation fallback to free-form should validate text and succeed");
+
+        assert_eq!(state.0, "Valid free-form summary");
+        assert!(!outcome.history.is_empty());
+
+        let tools = provider.tools_seen.lock().unwrap();
+        assert_eq!(tools.len(), 2);
+        // Turn 1 had tools enabled
+        assert!(tools[0].is_some());
+        // Turn 2 (recitation fallback active) had tools disabled
+        assert!(tools[1].is_none());
     }
 }
