@@ -12,10 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Cherry-pick review: context type and finding filter.
+//! Cherry-pick review: context type, finding filter, and stage prompts.
 
 pub mod context;
 pub mod filter;
+pub mod prompts;
 
 pub use context::{CherryPickContext, CherryPickReviewContext};
 pub use filter::filter_cherry_pick_findings;
+pub use prompts::*;
