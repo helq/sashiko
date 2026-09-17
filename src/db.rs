@@ -1611,7 +1611,16 @@ impl Database {
             self.conn.execute("PRAGMA user_version = 8", ()).await?;
         }
 
-        info!("Database schema is up to date at version 8.");
+        if current_version < 9 {
+            info!("Applying database migration version 9 (perf_indexes)...");
+            let tx = self.conn.transaction().await?;
+            tx.execute_batch(include_str!("migrations/009_perf_indexes.sql"))
+                .await?;
+            tx.execute("PRAGMA user_version = 9", ()).await?;
+            tx.commit().await?;
+        }
+
+        info!("Database schema is up to date at version 9.");
 
         Ok(())
     }
@@ -17211,5 +17220,41 @@ mod tests {
         // Query with offset beyond available (should return empty vec)
         let page3 = db.get_patchsets(10, 100, None, None).await.unwrap();
         assert!(page3.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_migrate_perf_indexes_on_version_1_db() {
+        let db_settings = crate::settings::DatabaseSettings::memory();
+        let db = Database::new(&db_settings).await.unwrap();
+
+        db.conn
+            .execute_batch(include_str!("migrations/001_initial.sql"))
+            .await
+            .unwrap();
+        db.conn
+            .execute("PRAGMA user_version = 1", ())
+            .await
+            .unwrap();
+
+        db.migrate().await.unwrap();
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name IN ('idx_reviews_created_at', 'idx_findings_review_severity', 'idx_patches_message_id')",
+                (),
+            )
+            .await
+            .unwrap();
+
+        let mut found_indexes = std::collections::HashSet::new();
+        while let Ok(Some(row)) = rows.next().await {
+            let name: String = row.get(0).unwrap();
+            found_indexes.insert(name);
+        }
+
+        assert!(found_indexes.contains("idx_reviews_created_at"));
+        assert!(found_indexes.contains("idx_findings_review_severity"));
+        assert!(found_indexes.contains("idx_patches_message_id"));
     }
 }
