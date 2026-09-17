@@ -38,6 +38,7 @@ pub mod prompt_bundle;
 pub mod review_kind;
 pub mod reviewer;
 pub mod settings;
+pub mod test_support;
 pub mod toolbox;
 pub mod utils;
 pub mod worker;
