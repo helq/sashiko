@@ -570,24 +570,19 @@ unrelated error whose message happens to contain "blocked".
   `self.recitation_fallback_active = true` and returns
   `RetryWithFeedback(reminder)`.
 
-**`recitation_fallback_active` has exactly one effect:**
-`response_format()` returns `None` early instead of
-`Some(AiResponseFormat::Json { schema })`. It does not change validation, it
-does not change the output format, and it is never reset for the rest of the
-session.
+**`recitation_fallback_active` has three effects:**
 
-Two consequences a reviewer should hold onto:
+1. `response_format()` returns `None` early instead of
+   `Some(AiResponseFormat::Json { schema })`.
+2. `tools()` returns `None` so the model cannot invoke tools during
+   free-form recitation fallback.
+3. For `OutputFormat::Text`, validation verifies that text is non-empty and
+   deserializes directly without re-running strict formatting validators
+   (such as `validate_inline_format` quote and header checks), allowing
+   the free-form recitation summary to be accepted.
 
-1. For a stage whose `OutputFormat` has no schema — `json()` or `Text` —
-   `response_format()` was already `None`, so the flag changes nothing at all.
-2. `report_stage` is the only user of `FallbackToFreeForm`, and it uses
-   `OutputFormat::text_with_validator(validate_inline_format,
-   format_inline_feedback)`. So the fallback drops nothing, and
-   `validate_inline_format` still requires `>`-quoted lines, a `commit `
-   header and an `Author:` header within the first 20 lines. The fallback
-   reminder — "Do not quote code verbatim. Summarize your review directly."
-   — pushes the model away from the `>` quoting that the validator then
-   demands. This looks like a live conflict, not a deliberate design.
+Once activated, `recitation_fallback_active` is never reset for the rest
+of the session.
 
 **Check in a diff:** a patch that sets `FallbackToFreeForm` on a stage,
 expecting the structured-output constraint to relax. Verify the stage

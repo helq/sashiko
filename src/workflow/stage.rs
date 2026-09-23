@@ -360,6 +360,9 @@ impl<'a, S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> LlmSess
     }
 
     fn tools(&self) -> Option<Vec<AiTool>> {
+        if self.recitation_fallback_active {
+            return None;
+        }
         match &self.stage.policy.tools {
             ToolScope::None => None,
             ToolScope::All => Some(self.tools.get_declarations_generic()),
@@ -975,40 +978,130 @@ mod tests {
         );
     }
 
-    struct RecitationThenFreeFormProvider {
-        turn: Mutex<usize>,
-    }
+    #[tokio::test]
+    async fn test_recitation_fallback_to_free_form_bypasses_custom_validator_and_disables_tools() {
+        struct RecitationProvider {
+            turn: Mutex<usize>,
+            tools_seen: Mutex<Vec<Option<Vec<AiTool>>>>,
+        }
 
-    #[async_trait]
-    impl AiProvider for RecitationThenFreeFormProvider {
-        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
-            let mut turn = self.turn.lock().unwrap();
-            *turn += 1;
-            if *turn == 1 {
-                anyhow::bail!("Gemini API blocked response (finish reason: RECITATION)");
+        #[async_trait]
+        impl AiProvider for RecitationProvider {
+            async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+                self.tools_seen.lock().unwrap().push(request.tools);
+                let mut turn = self.turn.lock().unwrap();
+                *turn += 1;
+                if *turn == 1 {
+                    anyhow::bail!("Generation blocked due to RECITATION");
+                }
+                Ok(AiResponse {
+                    content: Some("Plain summary without strict block quotes".to_string()),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    usage: None,
+                    truncated: false,
+                })
             }
-            Ok(AiResponse {
-                content: Some("Summary without verbatim diff quotes.".to_string()),
-                thought: None,
-                thought_signature: None,
-                tool_calls: None,
-                usage: None,
-                truncated: false,
+
+            fn get_capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities {
+                    model_name: "mock".to_string(),
+                    context_window_size: 100_000,
+                }
+            }
+        }
+
+        #[derive(Default, Clone)]
+        struct OutputState(String);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(RecitationProvider {
+            turn: Mutex::new(0),
+            tools_seen: Mutex::new(Vec::new()),
+        });
+        let env = WorkflowEnv {
+            provider: provider.clone(),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let stage: Stage<OutputState, String> = Stage::builder("recitation_text_stage")
+            .user_prompt(PromptTemplate::new("review patch"))
+            .tools(ToolScope::All)
+            .output_format(OutputFormat::text_with_validator(
+                |text, _| {
+                    if text.starts_with("> ") {
+                        Ok(())
+                    } else {
+                        Err("Output must begin with a block quote '> '".to_string())
+                    }
+                },
+                |v| format!("Validation failed: {v}"),
+            ))
+            .on_recitation(RecitationPolicy::FallbackToFreeForm {
+                reminder: "Rewrite in free-form without quoting.".to_string(),
             })
-        }
+            .reduce(|state: &mut OutputState, out: String| {
+                state.0 = out;
+            })
+            .build();
 
-        fn get_capabilities(&self) -> ProviderCapabilities {
-            ProviderCapabilities {
-                model_name: "mock".to_string(),
-                context_window_size: 100_000,
-            }
-        }
+        let mut state = OutputState::default();
+        let outcome = stage
+            .execute(&env, &mut state, None)
+            .await
+            .expect("recitation fallback to free-form should succeed even without matching strict validator");
+
+        assert_eq!(state.0, "Plain summary without strict block quotes");
+        assert!(!outcome.history.is_empty());
+
+        let tools = provider.tools_seen.lock().unwrap();
+        assert_eq!(tools.len(), 2);
+        // Turn 1 had tools enabled
+        assert!(tools[0].is_some());
+        // Turn 2 (recitation fallback active) had tools disabled
+        assert!(tools[1].is_none());
     }
 
     #[tokio::test]
-    async fn test_recitation_fallback_skips_text_validator() {
+    async fn test_recitation_fallback_rejects_empty_response() {
+        struct EmptyResponseProvider {
+            turn: Mutex<usize>,
+        }
+
+        #[async_trait]
+        impl AiProvider for EmptyResponseProvider {
+            async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+                let mut turn = self.turn.lock().unwrap();
+                *turn += 1;
+                if *turn == 1 {
+                    anyhow::bail!("Generation blocked due to RECITATION");
+                }
+                Ok(AiResponse {
+                    content: Some("   \n\t  ".to_string()),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    usage: None,
+                    truncated: false,
+                })
+            }
+
+            fn get_capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities {
+                    model_name: "mock".to_string(),
+                    context_window_size: 100_000,
+                }
+            }
+        }
+
+        #[derive(Default, Clone)]
+        struct OutputState(String);
+
         let tmp = tempfile::tempdir().unwrap();
-        let provider = Arc::new(RecitationThenFreeFormProvider {
+        let provider = Arc::new(EmptyResponseProvider {
             turn: Mutex::new(0),
         });
         let env = WorkflowEnv {
@@ -1018,31 +1111,28 @@ mod tests {
             context_tag: None,
         };
 
-        let stage: Stage<EmptyState, String> = Stage::builder("report")
-            .user_prompt(PromptTemplate::new("generate report"))
+        let stage: Stage<OutputState, String> = Stage::builder("recitation_empty_stage")
+            .user_prompt(PromptTemplate::new("review patch"))
             .output_format(OutputFormat::text_with_validator(
-                |text, _| {
-                    if !text.lines().any(|l| l.starts_with('>')) {
-                        Err("missing '>' quote".to_string())
-                    } else {
-                        Ok(())
-                    }
-                },
-                |v| v.to_string(),
+                |_, _| Ok(()),
+                |v| format!("Validation failed: {v}"),
             ))
             .policy(StagePolicy {
-                recitation_policy: RecitationPolicy::FallbackToFreeForm {
-                    reminder: "Do not quote code verbatim.".to_string(),
-                },
-                ..Default::default()
+                max_validation_attempts: 1,
+                ..StagePolicy::default()
             })
-            .reduce(|_: &mut EmptyState, _: String| {})
+            .on_recitation(RecitationPolicy::FallbackToFreeForm {
+                reminder: "Rewrite in free-form.".to_string(),
+            })
+            .reduce(|state: &mut OutputState, out: String| {
+                state.0 = out;
+            })
             .build();
 
-        let (_outcome, _mutation) = stage
-            .execute_isolated(&env, &EmptyState, None)
-            .await
-            .expect("recitation fallback should accept non-quoted text response");
+        let mut state = OutputState::default();
+        let err = stage.execute(&env, &mut state, None).await.unwrap_err();
+
+        assert!(err.to_string().contains("must not be empty"));
     }
 
     #[test]
