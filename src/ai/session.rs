@@ -22,6 +22,7 @@ use super::{
 };
 
 /// The unified result of executing an [`LlmSession`].
+#[derive(Debug)]
 pub struct SessionResult<T> {
     /// The validated output of the session.
     pub output: T,
@@ -56,6 +57,14 @@ pub enum ValidationError {
     FormatViolation(String),
     /// A fatal error that cannot be resolved by retrying.
     Fatal(String),
+}
+
+/// Errors that can occur during session execution.
+#[derive(Debug, thiserror::Error)]
+pub enum SessionError {
+    /// Turn budget and validation attempts were exhausted without producing a valid output.
+    #[error("Turn budget and validation attempts exhausted: {0}")]
+    ValidationExhausted(String),
 }
 
 /// Action to take upon encountering a provider error.
@@ -166,6 +175,7 @@ pub struct SessionRunner<'a> {
     max_transient_retries: usize,
     max_provider_error_retries: usize,
     on_turn: Option<Box<dyn Fn(usize, usize) + Send + Sync + 'a>>,
+    log_buffer: Option<&'a std::sync::Mutex<Vec<AiMessage>>>,
 }
 
 impl<'a> SessionRunner<'a> {
@@ -178,7 +188,15 @@ impl<'a> SessionRunner<'a> {
             max_transient_retries: 5,
             max_provider_error_retries: 3,
             on_turn: None,
+            log_buffer: None,
         }
+    }
+
+    /// Configures an external log buffer to capture conversation history as it occurs,
+    /// ensuring history is retained even if the session ends in an error.
+    pub fn with_log_buffer(mut self, buffer: &'a std::sync::Mutex<Vec<AiMessage>>) -> Self {
+        self.log_buffer = Some(buffer);
+        self
     }
 
     /// Configures the maximum validation retries.
@@ -236,6 +254,22 @@ impl<'a> SessionRunner<'a> {
             tool_calls: None,
             tool_call_id: None,
         }];
+
+        if let Some(buf) = self.log_buffer {
+            let mut guard = buf.lock().unwrap();
+            guard.clear();
+            guard.extend(log_history.clone());
+        }
+
+        macro_rules! push_log {
+            ($msg:expr) => {{
+                let m = $msg;
+                if let Some(buf) = self.log_buffer {
+                    buf.lock().unwrap().push(m.clone());
+                }
+                log_history.push(m);
+            }};
+        }
 
         let mut turns: usize = 0;
         let mut validation_attempts = 0;
@@ -295,7 +329,7 @@ impl<'a> SessionRunner<'a> {
                     tool_call_id: None,
                 };
                 history.push(final_prompt.clone());
-                log_history.push(final_prompt);
+                push_log!(final_prompt);
             }
 
             let tools = if is_final_turn { None } else { session.tools() };
@@ -366,7 +400,7 @@ impl<'a> SessionRunner<'a> {
                                     tool_call_id: None,
                                 };
                                 history.push(msg.clone());
-                                log_history.push(msg);
+                                push_log!(msg);
                                 turns = turns.saturating_sub(1);
                                 continue;
                             }
@@ -422,7 +456,7 @@ impl<'a> SessionRunner<'a> {
                 tool_call_id: None,
             };
             history.push(assistant_msg.clone());
-            log_history.push(assistant_msg);
+            push_log!(assistant_msg);
 
             // Handle Tool Calls
             if let Some(tool_calls) = &resp.tool_calls
@@ -460,7 +494,7 @@ impl<'a> SessionRunner<'a> {
                             tool_call_id: Some(call_id),
                         };
                         history.push(tool_msg.clone());
-                        log_history.push(tool_msg);
+                        push_log!(tool_msg);
                     }
                     continue; // Loop again to feed tool results back to LLM
                 }
@@ -490,16 +524,24 @@ impl<'a> SessionRunner<'a> {
                         for request in &rejected {
                             self.provider.forget(request).await;
                         }
-                        return Err(make_failure(
-                            format!(
-                                "Failed to generate valid response after {} validation attempts. Last violation: {}",
-                                self.max_validation_attempts, violation
-                            ),
-                            log_history,
-                            total_prompt_tokens,
-                            total_completion_tokens,
-                            total_cached_tokens,
-                        ));
+                        let msg = format!(
+                            "Failed to generate valid response after {} validation attempts. Last violation: {}",
+                            self.max_validation_attempts, violation
+                        );
+                        return Err(anyhow::Error::new(SessionError::ValidationExhausted(
+                            msg.clone(),
+                        ))
+                        .context(SessionFailure {
+                            message: msg,
+                            history: log_history,
+                            usage: AiUsage {
+                                prompt_tokens: total_prompt_tokens,
+                                completion_tokens: total_completion_tokens,
+                                total_tokens: total_prompt_tokens
+                                    .saturating_add(total_completion_tokens),
+                                cached_tokens: Some(total_cached_tokens),
+                            },
+                        }));
                     }
                     let feedback = session.format_validation_feedback(&violation);
                     let msg = AiMessage {
@@ -511,7 +553,7 @@ impl<'a> SessionRunner<'a> {
                         tool_call_id: None,
                     };
                     history.push(msg.clone());
-                    log_history.push(msg);
+                    push_log!(msg);
                     turns = turns.saturating_sub(1);
                 }
                 Result::Err(ValidationError::Fatal(err)) => {
@@ -707,5 +749,76 @@ mod tests {
                     .contains("TURN BUDGET EXHAUSTED")
         });
         assert!(exhausted_msg.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_session_runner_captures_log_buffer_on_error() {
+        struct AlwaysFailsValidation;
+        #[async_trait]
+        impl LlmSession for AlwaysFailsValidation {
+            type Output = String;
+            fn system_prompt(&self) -> String {
+                "system".to_string()
+            }
+            fn initial_user_prompt(&self) -> String {
+                "start".to_string()
+            }
+            fn validate(
+                &mut self,
+                _response: &AiResponse,
+            ) -> Result<Self::Output, ValidationError> {
+                Err(ValidationError::FormatViolation("bad schema".to_string()))
+            }
+            fn format_validation_feedback(&self, violation: &str) -> String {
+                format!("Retry: {violation}")
+            }
+        }
+
+        let responses = vec![
+            AiResponse {
+                content: Some("first try".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            },
+            AiResponse {
+                content: Some("second try".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            },
+        ];
+
+        let provider = MockProvider::new(responses);
+        let log_buffer = Mutex::new(Vec::new());
+        let runner = SessionRunner::new(&provider)
+            .with_max_turns(5)
+            .with_max_validation_attempts(2)
+            .with_log_buffer(&log_buffer);
+        let mut session = AlwaysFailsValidation;
+
+        let err = runner.run(&mut session).await.unwrap_err();
+        assert!(err.to_string().contains("validation attempts"));
+
+        drop(runner);
+        let history = log_buffer.into_inner().unwrap();
+        // Should contain: initial prompt, first response, validation feedback, second response
+        assert!(history.len() >= 3);
+        assert_eq!(history[0].role, AiRole::User);
+        assert_eq!(history[0].content.as_deref(), Some("start"));
+        assert_eq!(history[1].role, AiRole::Assistant);
+        assert_eq!(history[1].content.as_deref(), Some("first try"));
+        assert_eq!(history[2].role, AiRole::User);
+        assert!(
+            history[2]
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("Retry: bad schema")
+        );
     }
 }
