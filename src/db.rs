@@ -9907,6 +9907,82 @@ impl Database {
         Ok(count)
     }
 
+    /// Count patchsets sharing repo_url within +-window_secs of arrival.
+    pub async fn count_batch_siblings(
+        &self,
+        repo_url: Option<&str>,
+        date: i64,
+        window_secs: i64,
+    ) -> Result<i64> {
+        let min_d = date.saturating_sub(window_secs);
+        let max_d = date.saturating_add(window_secs);
+        let mut rows = if let Some(url) = repo_url {
+            let q = "SELECT COUNT(*) FROM patchsets p LEFT JOIN baselines b ON p.baseline_id = b.id WHERE COALESCE(created_at, date) BETWEEN ? AND ? AND b.repo_url = ?";
+            self.conn
+                .query(q, libsql::params![min_d, max_d, url])
+                .await?
+        } else {
+            let q = "SELECT COUNT(*) FROM patchsets p LEFT JOIN baselines b ON p.baseline_id = b.id WHERE COALESCE(created_at, date) BETWEEN ? AND ? AND (p.baseline_id IS NULL OR b.repo_url IS NULL)";
+            self.conn.query(q, libsql::params![min_d, max_d]).await?
+        };
+        let count = match rows.next().await? {
+            Some(r) => r.get::<i64>(0)?,
+            None => 0,
+        };
+        Ok(count)
+    }
+
+    /// Deprioritize patchsets based on sibling count in time window.
+    pub async fn apply_batch_deprioritization(
+        &self,
+        patchset_id: i64,
+        window_secs: i64,
+        tiers: &[(i64, i32)],
+    ) -> Result<()> {
+        if tiers.is_empty() {
+            return Ok(());
+        }
+        let q = "SELECT COALESCE(p.created_at, p.date), b.repo_url FROM patchsets p LEFT JOIN baselines b ON p.baseline_id = b.id WHERE p.id = ?";
+        let mut rows = self.conn.query(q, libsql::params![patchset_id]).await?;
+        let (Some(date), repo_url): (Option<i64>, Option<String>) = (match rows.next().await? {
+            Some(row) => (row.get(0)?, row.get(1)?),
+            None => return Ok(()),
+        }) else {
+            return Ok(());
+        };
+        drop(rows);
+        let size = self
+            .count_batch_siblings(repo_url.as_deref(), date, window_secs)
+            .await?;
+        let Some(&(_min_size, cap)) = tiers
+            .iter()
+            .filter(|(s, _)| size >= *s)
+            .max_by_key(|(s, _)| *s)
+        else {
+            return Ok(());
+        };
+        let min_d = date.saturating_sub(window_secs);
+        let max_d = date.saturating_add(window_secs);
+        let affected = if let Some(url) = repo_url.as_deref() {
+            let q = "UPDATE patchsets SET priority_cap = MIN(COALESCE(priority_cap, ?), ?), priority = MIN(COALESCE(base_priority, 500), MIN(COALESCE(priority_cap, ?), ?)) WHERE COALESCE(created_at, date) BETWEEN ? AND ? AND (priority_cap IS NULL OR priority_cap > ?) AND EXISTS (SELECT 1 FROM baselines WHERE id = patchsets.baseline_id AND repo_url = ?)";
+            self.execute(
+                q,
+                libsql::params![cap, cap, cap, cap, min_d, max_d, cap, url],
+            )
+            .await?
+        } else {
+            let q = "UPDATE patchsets SET priority_cap = MIN(COALESCE(priority_cap, ?), ?), priority = MIN(COALESCE(base_priority, 500), MIN(COALESCE(priority_cap, ?), ?)) WHERE COALESCE(created_at, date) BETWEEN ? AND ? AND (priority_cap IS NULL OR priority_cap > ?) AND (baseline_id IS NULL OR EXISTS (SELECT 1 FROM baselines WHERE id = patchsets.baseline_id AND repo_url IS NULL))";
+            self.execute(q, libsql::params![cap, cap, cap, cap, min_d, max_d, cap])
+                .await?
+        };
+        if affected > 0 {
+            let repo = repo_url.as_deref().map(crate::utils::redact_secret);
+            tracing::info!(
+                "Batch deprioritization: patchset {patchset_id} in batch of {size} (±{window_secs}s, repo={repo:?}) capped {affected} patchset(s) to priority {cap}"
+            );
+        }
+        Ok(())
+    }
     pub fn calculate_priority(
         subject: &str,
         rules: &[crate::settings::CompiledPriorityRule],
