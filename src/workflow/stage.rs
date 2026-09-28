@@ -173,7 +173,7 @@ pub struct Stage<S, T> {
     pub system_prompt: Option<PromptTemplate<S>>,
     pub user_prompt: PromptTemplate<S>,
     pub output_format: OutputFormat<S, T>,
-    pub policy: StagePolicy,
+    pub policy: StagePolicy<S>,
     pub reducer: StageReducer<S, T>,
     pub outcome_reducer: Option<StageOutcomeReducer<S, T>>,
     pub skip_if: Option<StageCondition<S>>,
@@ -192,7 +192,7 @@ pub struct StageBuilder<S, T> {
     system_prompt: Option<PromptTemplate<S>>,
     user_prompt: Option<PromptTemplate<S>>,
     output_format: Option<OutputFormat<S, T>>,
-    policy: StagePolicy,
+    policy: StagePolicy<S>,
     reducer: Option<StageReducer<S, T>>,
     outcome_reducer: Option<StageOutcomeReducer<S, T>>,
     skip_if: Option<StageCondition<S>>,
@@ -231,8 +231,20 @@ impl<S: 'static, T: 'static> StageBuilder<S, T> {
     }
 
     /// Sets the stage execution policy.
-    pub fn policy(mut self, policy: StagePolicy) -> Self {
+    pub fn policy(mut self, mut policy: StagePolicy<S>) -> Self {
+        if policy.on_validation_exhausted.is_none() {
+            policy.on_validation_exhausted = self.policy.on_validation_exhausted.clone();
+        }
         self.policy = policy;
+        self
+    }
+
+    /// Configures a fallback state mutation callback if validation retries are exhausted.
+    pub fn on_validation_exhausted<F>(mut self, fallback: F) -> Self
+    where
+        F: Fn(&mut S) + Send + Sync + 'static,
+    {
+        self.policy.on_validation_exhausted = Some(Arc::new(fallback));
         self
     }
 
