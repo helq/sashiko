@@ -413,7 +413,27 @@ impl<'a> SessionRunner<'a> {
                     total_cached_tokens.saturating_add(usage.cached_tokens.unwrap_or(0));
             }
 
-            let assistant_msg = AiMessage {
+            let has_tool_calls = resp.tool_calls.as_ref().is_some_and(|tc| !tc.is_empty());
+
+            let mut history_content = resp.content.clone();
+            let mut history_tool_calls = resp.tool_calls.clone();
+
+            if is_final_turn && has_tool_calls {
+                history_tool_calls = None;
+                if history_content.as_deref().unwrap_or("").trim().is_empty() {
+                    history_content = Some("[Tool call ignored on final turn]".to_string());
+                }
+            }
+
+            let history_msg = AiMessage {
+                role: AiRole::Assistant,
+                content: history_content,
+                thought: resp.thought.clone(),
+                thought_signature: resp.thought_signature.clone(),
+                tool_calls: history_tool_calls.clone(),
+                tool_call_id: None,
+            };
+            let log_msg = AiMessage {
                 role: AiRole::Assistant,
                 content: resp.content.clone(),
                 thought: resp.thought.clone(),
@@ -421,19 +441,17 @@ impl<'a> SessionRunner<'a> {
                 tool_calls: resp.tool_calls.clone(),
                 tool_call_id: None,
             };
-            history.push(assistant_msg.clone());
-            log_history.push(assistant_msg);
+            history.push(history_msg);
+            log_history.push(log_msg);
 
             // Handle Tool Calls
-            if let Some(tool_calls) = &resp.tool_calls
-                && !tool_calls.is_empty()
-            {
+            if has_tool_calls {
                 if is_final_turn {
                     tracing::warn!(
                         "Model emitted tool calls on final turn; ignoring tools to force validation."
                     );
                 } else {
-                    let results = match session.call_tools(tool_calls.clone()).await {
+                    let results = match session.call_tools(resp.tool_calls.clone().unwrap()).await {
                         Ok(r) => r,
                         Err(e) => {
                             let message = e.to_string();
@@ -467,7 +485,19 @@ impl<'a> SessionRunner<'a> {
             }
 
             // No tool calls: validate response
-            match session.validate(&resp) {
+            let validation_result = if is_final_turn
+                && has_tool_calls
+                && resp.content.as_deref().unwrap_or("").trim().is_empty()
+            {
+                Err(ValidationError::FormatViolation(
+                    "Tool calls are not permitted on the final turn. Emit your final response directly without calling tools."
+                        .to_string(),
+                ))
+            } else {
+                session.validate(&resp)
+            };
+
+            match validation_result {
                 Result::Ok(output) => {
                     let usage = AiUsage {
                         prompt_tokens: total_prompt_tokens,
@@ -537,19 +567,22 @@ mod tests {
 
     struct MockProvider {
         responses: Mutex<VecDeque<AiResponse>>,
+        requests: Mutex<Vec<AiRequest>>,
     }
 
     impl MockProvider {
         fn new(responses: Vec<AiResponse>) -> Self {
             Self {
                 responses: Mutex::new(responses.into()),
+                requests: Mutex::new(Vec::new()),
             }
         }
     }
 
     #[async_trait]
     impl AiProvider for MockProvider {
-        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+        async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+            self.requests.lock().unwrap().push(request);
             let mut q = self.responses.lock().unwrap();
             q.pop_front()
                 .ok_or_else(|| anyhow::anyhow!("No more mock responses"))
@@ -707,5 +740,179 @@ mod tests {
                     .contains("TURN BUDGET EXHAUSTED")
         });
         assert!(exhausted_msg.is_some());
+    }
+
+    struct RetryValidationSession {
+        attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmSession for RetryValidationSession {
+        type Output = String;
+
+        fn system_prompt(&self) -> String {
+            "system".to_string()
+        }
+
+        fn initial_user_prompt(&self) -> String {
+            "initial prompt".to_string()
+        }
+
+        fn validate(&mut self, response: &AiResponse) -> Result<Self::Output, ValidationError> {
+            let n = self
+                .attempts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n == 0 {
+                Err(ValidationError::FormatViolation(
+                    "invalid format".to_string(),
+                ))
+            } else {
+                Ok(response.content.clone().unwrap_or_default())
+            }
+        }
+
+        fn format_validation_feedback(&self, violation: &str) -> String {
+            format!("Fix: {violation}")
+        }
+    }
+
+    #[tokio::test]
+    async fn test_session_runner_strips_tool_calls_on_final_turn() {
+        let responses = vec![
+            // Turn 1 (max turns = 1): model returns content AND tool calls, fails validation
+            AiResponse {
+                content: Some("First invalid answer".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_ignored".to_string(),
+                    function_name: "ok_tool".to_string(),
+                    arguments: serde_json::json!({}),
+                    thought_signature: None,
+                }]),
+                usage: None,
+                truncated: false,
+            },
+            // Turn 1 retry: valid output
+            AiResponse {
+                content: Some("Final answer".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            },
+        ];
+
+        let provider = MockProvider::new(responses);
+        let runner = SessionRunner::new(&provider).with_max_turns(1);
+        let mut session = RetryValidationSession {
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let res = runner.run(&mut session).await.unwrap();
+        assert_eq!(res.output, "Final answer");
+
+        // The audit log (res.history) MUST preserve the exact tool_calls generated by the model
+        let assistant_msg = res
+            .history
+            .iter()
+            .find(|m| m.role == AiRole::Assistant)
+            .expect("assistant message should be in history");
+        assert!(
+            assistant_msg.tool_calls.is_some(),
+            "audit log should preserve tool calls"
+        );
+        assert_eq!(
+            assistant_msg.content.as_deref(),
+            Some("First invalid answer")
+        );
+
+        // The retry request sent to the provider MUST have the tool calls stripped
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let retry_assistant_msg = requests[1]
+            .messages
+            .iter()
+            .find(|m| m.role == AiRole::Assistant)
+            .expect("retry request must contain previous assistant message");
+        assert!(
+            retry_assistant_msg.tool_calls.is_none(),
+            "retry request should strip tool calls"
+        );
+        assert_eq!(
+            retry_assistant_msg.content.as_deref(),
+            Some("First invalid answer")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_session_runner_strips_tool_calls_with_empty_content_on_final_turn() {
+        let responses = vec![
+            // Turn 1 (max turns = 1): model returns only tool calls (content: None)
+            AiResponse {
+                content: None,
+                thought: None,
+                thought_signature: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_only".to_string(),
+                    function_name: "ok_tool".to_string(),
+                    arguments: serde_json::json!({}),
+                    thought_signature: None,
+                }]),
+                usage: None,
+                truncated: false,
+            },
+            // Turn 1 retry: valid output
+            AiResponse {
+                content: Some("Recovered answer".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            },
+        ];
+
+        let provider = MockProvider::new(responses);
+        let runner = SessionRunner::new(&provider).with_max_turns(1);
+        let mut session = RetryValidationSession {
+            attempts: std::sync::atomic::AtomicUsize::new(1),
+        };
+
+        let res = runner.run(&mut session).await.unwrap();
+        assert_eq!(res.output, "Recovered answer");
+
+        // The audit log (res.history) MUST preserve empty content and tool_calls
+        let assistant_msg = res
+            .history
+            .iter()
+            .find(|m| m.role == AiRole::Assistant)
+            .expect("assistant message should be in history");
+        assert!(
+            assistant_msg.tool_calls.is_some(),
+            "audit log should preserve tool calls"
+        );
+        assert_eq!(
+            assistant_msg.content, None,
+            "audit log should preserve unpopulated content"
+        );
+
+        // The retry request sent to the provider MUST have non-empty placeholder content and no tool calls
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let retry_assistant_msg = requests[1]
+            .messages
+            .iter()
+            .find(|m| m.role == AiRole::Assistant)
+            .expect("retry request must contain previous assistant message");
+        assert!(
+            retry_assistant_msg.tool_calls.is_none(),
+            "retry request should strip tool calls"
+        );
+        assert_eq!(
+            retry_assistant_msg.content.as_deref(),
+            Some("[Tool call ignored on final turn]")
+        );
     }
 }
