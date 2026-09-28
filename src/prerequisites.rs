@@ -1296,7 +1296,8 @@ mod tests {
                 "CREATE TABLE patchsets (
                     id INTEGER PRIMARY KEY,
                     status TEXT,
-                    date INTEGER
+                    date INTEGER,
+                    baseline_id INTEGER
                 );
                 CREATE TABLE patches (
                     id INTEGER PRIMARY KEY,
@@ -1331,7 +1332,7 @@ mod tests {
 
         let mut version = db.conn.query("PRAGMA user_version", ()).await?;
         let version: u32 = version.next().await?.expect("user version row").get(0)?;
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
         Ok(())
     }
 

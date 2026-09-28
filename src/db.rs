@@ -2079,7 +2079,34 @@ impl Database {
             }
         }
 
-        info!("Database schema is up to date at version 14.");
+        if current_version < 15 {
+            info!("Applying database migration version 15 (batch deprior arrival timestamp)...");
+            let has_created_at = {
+                let mut columns = self.conn.query("PRAGMA table_info(patchsets)", ()).await?;
+                let mut found = false;
+                while let Some(row) = columns.next().await? {
+                    let name: String = row.get(1)?;
+                    found |= name == "created_at";
+                }
+                found
+            };
+            if !has_created_at {
+                let tx = self.begin_transaction().await?;
+                tx.execute_batch(include_str!("migrations/014_batch_deprior.sql"))
+                    .await?;
+                tx.execute("PRAGMA user_version = 15", ()).await?;
+                tx.commit().await?;
+            } else {
+                self.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_patchsets_arrival ON patchsets(COALESCE(created_at, date), baseline_id)",
+                    (),
+                )
+                .await?;
+                self.execute("PRAGMA user_version = 15", ()).await?;
+            }
+        }
+
+        info!("Database schema is up to date at version 15.");
 
         Ok(())
     }
@@ -7402,16 +7429,18 @@ impl Database {
         }
 
         let eff_priority = priority.unwrap_or(crate::settings::DEFAULT_PRIORITY);
+        let created_at = chrono::Utc::now().timestamp();
         let id = self
             .query_returning_i64(
-                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, author, date, total_parts, received_parts, status, parser_version, to_recipients, cc_recipients, subject_index, baseline_id, baseline_part_index, skip_filters, only_filters, base_priority, priority)
-                 VALUES (?, ?, ?, ?, ?, ?, 0, 'Incomplete', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, author, date, created_at, total_parts, received_parts, status, parser_version, to_recipients, cc_recipients, subject_index, baseline_id, baseline_part_index, skip_filters, only_filters, base_priority, priority)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'Incomplete', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
                 libsql::params![
                     thread_id,
                     final_cover_id.as_deref(),
                     subject,
                     author,
                     date,
+                    created_at,
                     total_parts,
                     parser_version,
                     to,
@@ -9808,9 +9837,9 @@ impl Database {
         let eff_priority = priority.unwrap_or(crate::settings::DEFAULT_PRIORITY);
         let id = self
             .query_returning_i64(
-                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, status, date, skip_filters, only_filters, mr_url, mr_title, mr_number, slug, base_priority, priority)
-                     VALUES (?, ?, ?, 'Fetching', ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-                libsql::params![thread_id, root_msg_id, effective_subject, now, skip_filters_json, only_filters_json, mr_url, mr_title, mr_number, slug, priority, eff_priority],
+                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, status, date, created_at, skip_filters, only_filters, mr_url, mr_title, mr_number, slug, base_priority, priority)
+                     VALUES (?, ?, ?, 'Fetching', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                libsql::params![thread_id, root_msg_id, effective_subject, now, now, skip_filters_json, only_filters_json, mr_url, mr_title, mr_number, slug, priority, eff_priority],
             )
             .await?
             .ok_or_else(|| anyhow::anyhow!("Failed to get patchset ID"))?;
@@ -12966,7 +12995,7 @@ mod tests {
 
         let mut v_rows = db.conn.query("PRAGMA user_version", ()).await.unwrap();
         let version: i64 = v_rows.next().await.unwrap().unwrap().get(0).unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
 
         // Must now be able to query and insert priority-aware patchsets without column errors
         let thread_id = db.create_thread("root", "Test Thread", 1000).await.unwrap();
@@ -18890,7 +18919,7 @@ mod tests {
 
         let mut v_rows = db.conn.query("PRAGMA user_version", ()).await.unwrap();
         let version: i64 = v_rows.next().await.unwrap().unwrap().get(0).unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
 
         let mut rows = db
             .conn
