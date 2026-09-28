@@ -49,9 +49,11 @@ pub enum RecitationPolicy {
     FallbackToFreeForm { reminder: String },
 }
 
+/// Fallback function invoked on mutable workflow state when stage validation retries are exhausted.
+pub type ValidationFallback<S> = std::sync::Arc<dyn Fn(&mut S) + Send + Sync>;
+
 /// Execution policies, limits, and retry configuration for a stage.
-#[derive(Clone, Debug)]
-pub struct StagePolicy {
+pub struct StagePolicy<S = ()> {
     /// Maximum conversational turns allowed for this stage.
     pub max_turns: usize,
     /// Maximum validation retries on invalid output format.
@@ -64,9 +66,42 @@ pub struct StagePolicy {
     pub recitation_policy: RecitationPolicy,
     /// Optional per-stage reasoning effort override.
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Optional fallback callback invoked if validation retries are exhausted.
+    pub on_validation_exhausted: Option<ValidationFallback<S>>,
 }
 
-impl Default for StagePolicy {
+impl<S> Clone for StagePolicy<S> {
+    fn clone(&self) -> Self {
+        Self {
+            max_turns: self.max_turns,
+            max_validation_attempts: self.max_validation_attempts,
+            temperature: self.temperature,
+            tools: self.tools.clone(),
+            recitation_policy: self.recitation_policy.clone(),
+            reasoning_effort: self.reasoning_effort,
+            on_validation_exhausted: self.on_validation_exhausted.clone(),
+        }
+    }
+}
+
+impl<S> std::fmt::Debug for StagePolicy<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StagePolicy")
+            .field("max_turns", &self.max_turns)
+            .field("max_validation_attempts", &self.max_validation_attempts)
+            .field("temperature", &self.temperature)
+            .field("tools", &self.tools)
+            .field("recitation_policy", &self.recitation_policy)
+            .field("reasoning_effort", &self.reasoning_effort)
+            .field(
+                "on_validation_exhausted",
+                &self.on_validation_exhausted.as_ref().map(|_| "<fallback>"),
+            )
+            .finish()
+    }
+}
+
+impl<S> Default for StagePolicy<S> {
     fn default() -> Self {
         Self {
             max_turns: 15,
@@ -81,6 +116,7 @@ impl Default for StagePolicy {
                     .to_string(),
             ),
             reasoning_effort: None,
+            on_validation_exhausted: None,
         }
     }
 }
