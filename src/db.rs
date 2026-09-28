@@ -2057,7 +2057,29 @@ impl Database {
             tx.commit().await?;
         }
 
-        info!("Database schema is up to date at version 13.");
+        if current_version < 14 {
+            info!("Applying database migration version 14 (priority)...");
+            let has_base_priority = {
+                let mut columns = self.conn.query("PRAGMA table_info(patchsets)", ()).await?;
+                let mut found = false;
+                while let Some(row) = columns.next().await? {
+                    let name: String = row.get(1)?;
+                    found |= name == "base_priority";
+                }
+                found
+            };
+            if !has_base_priority {
+                let tx = self.begin_transaction().await?;
+                tx.execute_batch(include_str!("migrations/013_priority.sql"))
+                    .await?;
+                tx.execute("PRAGMA user_version = 14", ()).await?;
+                tx.commit().await?;
+            } else {
+                self.execute("PRAGMA user_version = 14", ()).await?;
+            }
+        }
+
+        info!("Database schema is up to date at version 14.");
 
         Ok(())
     }
@@ -6666,7 +6688,7 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT id, date, author, subject, subject_index, total_parts, received_parts, cover_letter_message_id, thread_id, baseline_id, baseline_part_index, status FROM patchsets
+                "SELECT id, date, author, subject, subject_index, total_parts, received_parts, cover_letter_message_id, thread_id, baseline_id, baseline_part_index, status, base_priority FROM patchsets
                  WHERE thread_id = ? OR (author = ? AND date BETWEEN ? AND ?)
                  ORDER BY id ASC",
                 libsql::params![thread_id, author, window_start, window_end],
@@ -6683,6 +6705,7 @@ impl Database {
             baseline_part: Option<u32>,
             patches_reply_to_new_cover: bool,
             is_placeholder: bool,
+            base_priority: Option<i32>,
         }
 
         let mut matches: Vec<CandidateMatch> = Vec::new();
@@ -6700,6 +6723,7 @@ impl Database {
             let existing_baseline_id: Option<i64> = row.get(9).ok();
             let existing_baseline_part: Option<u32> = row.get(10).ok();
             let existing_status: String = row.get(11).unwrap_or_else(|_| "Unknown".to_string());
+            let existing_base_priority: Option<i32> = row.get(12).ok();
 
             // A message that this patchset already holds is being processed
             // again, rather than arriving for the first time.
@@ -6885,9 +6909,11 @@ impl Database {
                     baseline_part: existing_baseline_part,
                     patches_reply_to_new_cover,
                     is_placeholder,
+                    base_priority: existing_base_priority,
                 });
             }
         }
+        drop(rows);
 
         if !matches.is_empty() {
             // Keep the row with the lowest ID (created first) as the primary target
@@ -6904,6 +6930,15 @@ impl Database {
                 for merge_from in matches.iter().skip(1) {
                     let merge_from_id = merge_from.id;
                     info!("Merging patchset {} into {}", merge_from_id, target_id);
+
+                    // Inherit higher base_priority from merged patchset if present
+                    if let Some(other_prio) = merge_from.base_priority {
+                        tx.execute(
+                            "UPDATE patchsets SET base_priority = COALESCE(MAX(base_priority, ?), ?), priority = CASE WHEN priority_cap IS NOT NULL THEN MIN(priority_cap, COALESCE(MAX(base_priority, ?), ?)) ELSE COALESCE(MAX(base_priority, ?), ?) END WHERE id = ?",
+                            libsql::params![other_prio, other_prio, other_prio, other_prio, other_prio, other_prio, target_id],
+                        )
+                        .await?;
+                    }
 
                     // Re-point any bugs referencing duplicate patches before deleting them
                     tx.execute(
@@ -7273,11 +7308,29 @@ impl Database {
             }
         }
 
+        let eff_priority = crate::settings::DEFAULT_PRIORITY;
         let id = self
             .query_returning_i64(
-                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, author, date, total_parts, received_parts, status, parser_version, to_recipients, cc_recipients, subject_index, baseline_id, baseline_part_index, skip_filters, only_filters)
-                 VALUES (?, ?, ?, ?, ?, ?, 0, 'Incomplete', ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-                libsql::params![thread_id, final_cover_id.as_deref(), subject, author, date, total_parts, parser_version, to, cc, if part_index == 0 && Self::is_reply_subject(subject) { 9999 } else { part_index }, baseline_id, baseline_id.map(|_| part_index), skip_filters_json.clone(), only_filters_json.clone()],
+                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, author, date, total_parts, received_parts, status, parser_version, to_recipients, cc_recipients, subject_index, baseline_id, baseline_part_index, skip_filters, only_filters, base_priority, priority)
+                 VALUES (?, ?, ?, ?, ?, ?, 0, 'Incomplete', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                libsql::params![
+                    thread_id,
+                    final_cover_id.as_deref(),
+                    subject,
+                    author,
+                    date,
+                    total_parts,
+                    parser_version,
+                    to,
+                    cc,
+                    if part_index == 0 && Self::is_reply_subject(subject) { 9999 } else { part_index },
+                    baseline_id,
+                    baseline_id.map(|_| part_index),
+                    skip_filters_json.clone(),
+                    only_filters_json.clone(),
+                    None as Option<i32>,
+                    eff_priority,
+                ],
             )
             .await?
             .ok_or_else(|| anyhow::anyhow!("Failed to retrieve patchset ID after insert"))?;
@@ -8852,7 +8905,7 @@ impl Database {
     pub async fn get_pending_patchsets(&self, limit: usize) -> Result<Vec<PatchsetRow>> {
         let mut rows = self.conn.query(
             "SELECT id, subject, status, thread_id, author, date, cover_letter_message_id, total_parts, received_parts, baseline_id, failed_reason, target_review_count, skip_filters, only_filters, embargo_until, slug, mr_url, mr_title, mr_number
-             FROM patchsets WHERE status = 'Pending' ORDER BY date ASC LIMIT ?",
+             FROM patchsets WHERE status = 'Pending' ORDER BY priority DESC, date ASC LIMIT ?",
             libsql::params![limit as i64],
         ).await?;
 
@@ -9721,6 +9774,22 @@ impl Database {
             )
             .await?;
         Ok(count)
+    }
+
+    pub fn calculate_priority(
+        subject: &str,
+        rules: &[crate::settings::CompiledPriorityRule],
+    ) -> Option<i32> {
+        let mut priority = None;
+        for rule in rules {
+            if rule.regex.is_match(subject) {
+                priority = Some(
+                    rule.priority
+                        .clamp(crate::settings::MIN_PRIORITY, crate::settings::MAX_PRIORITY),
+                );
+            }
+        }
+        priority
     }
 
     pub async fn update_patchset_baseline_info(
@@ -17704,12 +17773,12 @@ mod tests {
             )
             .await
             .unwrap();
-        db.conn
-            .execute("PRAGMA user_version = 3", ())
-            .await
-            .unwrap();
+        let retire = include_str!("migrations/004_retire_folded_bug_pipelines.sql");
+        db.conn.execute_batch(retire).await.unwrap();
 
-        db.migrate().await.unwrap();
+        let mut v_rows = db.conn.query("PRAGMA user_version", ()).await.unwrap();
+        let version: i64 = v_rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(version, 14);
 
         let mut rows = db
             .conn
