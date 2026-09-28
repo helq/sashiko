@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use crate::ai::{
     AiMessage, AiProvider, AiResponse, AiResponseFormat, AiTool, ErrorAction, LlmSession,
-    ReasoningEffort, SessionRunner, ToolCall, ValidationError,
+    ReasoningEffort, SessionError, SessionRunner, ToolCall, ValidationError,
 };
 use crate::toolbox::ToolBox;
 
@@ -554,7 +554,7 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
         let log_user_prompt = self.user_prompt.render_for_log(state);
 
         let stage_name = self.name;
-        let result = {
+        let run_result = {
             let mut session = StageSession {
                 stage: self,
                 state,
@@ -580,45 +580,94 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
                     }
                 });
 
-            runner.run(&mut session).await?
+            runner.run(&mut session).await
         };
 
-        let tokens_in = u32::try_from(result.usage.prompt_tokens).unwrap_or(u32::MAX);
-        let tokens_out = u32::try_from(result.usage.completion_tokens).unwrap_or(u32::MAX);
-        let tokens_cached =
-            u32::try_from(result.usage.cached_tokens.unwrap_or(0)).unwrap_or(u32::MAX);
+        match run_result {
+            Ok(result) => {
+                let tokens_in = u32::try_from(result.usage.prompt_tokens).unwrap_or(u32::MAX);
+                let tokens_out = u32::try_from(result.usage.completion_tokens).unwrap_or(u32::MAX);
+                let tokens_cached =
+                    u32::try_from(result.usage.cached_tokens.unwrap_or(0)).unwrap_or(u32::MAX);
 
-        if let Some(cb) = event_cb {
-            cb(WorkflowEvent::StageFinished {
-                stage_name: self.name,
-                tokens_in,
-                tokens_out,
-                tokens_cached,
-            });
+                if let Some(cb) = event_cb {
+                    cb(WorkflowEvent::StageFinished {
+                        stage_name: self.name,
+                        tokens_in,
+                        tokens_out,
+                        tokens_cached,
+                    });
+                }
+
+                let outcome = StageOutcome {
+                    tokens_in,
+                    tokens_out,
+                    tokens_cached,
+                    history: result.history,
+                    skipped: false,
+                };
+
+                let mutation: StateMutation<S> =
+                    if let Some(ref outcome_reducer) = self.outcome_reducer {
+                        let outcome_reducer = outcome_reducer.clone();
+                        let outcome_clone = outcome.clone();
+                        Box::new(move |s: &mut S| {
+                            outcome_reducer(s, result.output, &outcome_clone);
+                        })
+                    } else {
+                        let reducer = self.reducer.clone();
+                        Box::new(move |s: &mut S| {
+                            reducer(s, result.output);
+                        })
+                    };
+
+                Ok((outcome, mutation))
+            }
+            Err(err) => {
+                let is_validation_exhausted = err.downcast_ref::<SessionError>().is_some();
+                if is_validation_exhausted
+                    && let Some(ref fallback) = self.policy.on_validation_exhausted
+                {
+                    let (tokens_in, tokens_out, tokens_cached, history) =
+                        if let Some(failure) = err.downcast_ref::<crate::ai::SessionFailure>() {
+                            (
+                                u32::try_from(failure.usage.prompt_tokens).unwrap_or(u32::MAX),
+                                u32::try_from(failure.usage.completion_tokens).unwrap_or(u32::MAX),
+                                u32::try_from(failure.usage.cached_tokens.unwrap_or(0))
+                                    .unwrap_or(u32::MAX),
+                                failure.history.clone(),
+                            )
+                        } else {
+                            (0, 0, 0, Vec::new())
+                        };
+
+                    if let Some(cb) = event_cb {
+                        cb(WorkflowEvent::StageFinished {
+                            stage_name: self.name,
+                            tokens_in,
+                            tokens_out,
+                            tokens_cached,
+                        });
+                    }
+
+                    let fb = fallback.clone();
+                    let mutation: StateMutation<S> = Box::new(move |s: &mut S| {
+                        fb(s);
+                    });
+
+                    let outcome = StageOutcome {
+                        tokens_in,
+                        tokens_out,
+                        tokens_cached,
+                        history,
+                        skipped: false,
+                    };
+
+                    return Ok((outcome, mutation));
+                }
+                Err(err)
+            }
         }
-
-        let outcome = StageOutcome {
-            tokens_in,
-            tokens_out,
-            tokens_cached,
-            history: result.history,
-            skipped: false,
-        };
-
-        let mutation: StateMutation<S> = if let Some(ref outcome_reducer) = self.outcome_reducer {
-            let outcome_reducer = outcome_reducer.clone();
-            let outcome_clone = outcome.clone();
-            Box::new(move |s: &mut S| {
-                outcome_reducer(s, result.output, &outcome_clone);
-            })
-        } else {
-            let reducer = self.reducer.clone();
-            Box::new(move |s: &mut S| {
-                reducer(s, result.output);
-            })
-        };
-
-        Ok((outcome, mutation))
     }
 }
 
