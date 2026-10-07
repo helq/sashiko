@@ -12006,6 +12006,60 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_calculate_priority_full_subject_matching() {
+        let rules = [
+            crate::settings::PriorityRule {
+                regex: r"\[net-next\]".to_string(),
+                priority: 600,
+            }
+            .compile()
+            .unwrap(),
+            crate::settings::PriorityRule {
+                regex: "(?i)PRODKERNEL:".to_string(),
+                priority: 750,
+            }
+            .compile()
+            .unwrap(),
+            crate::settings::PriorityRule {
+                regex: "^PRODKERNEL:".to_string(),
+                priority: 800,
+            }
+            .compile()
+            .unwrap(),
+        ];
+
+        // An unanchored regex matches within the full subject including patch prefixes
+        assert_eq!(
+            Database::calculate_priority("[PATCH v2 1/3] PRODKERNEL: fix race", &rules),
+            Some(750)
+        );
+        assert_eq!(
+            Database::calculate_priority(
+                "Re: [PATCH net-next v2 1/2] PRODKERNEL: perf fix",
+                &rules
+            ),
+            Some(750)
+        );
+        assert_eq!(
+            Database::calculate_priority("#123 [v2]: PRODKERNEL: fix race", &rules),
+            Some(750)
+        );
+        assert_eq!(
+            Database::calculate_priority("[PATCH][net-next] tcp: routine cleanup", &rules),
+            Some(600)
+        );
+        // An anchored regex only matches when at the start of the full subject
+        assert_eq!(
+            Database::calculate_priority("PRODKERNEL: urgent fix", &rules),
+            Some(800)
+        );
+        assert_eq!(
+            Database::calculate_priority("[PATCH v2 1/3] net: regular fix", &rules),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn test_patchset_priority_routing() {
         let db = setup_db().await;
@@ -12014,7 +12068,7 @@ mod tests {
 
         let rules_config = [
             crate::settings::PriorityRule {
-                regex: "(?i)^PRODKERNEL:".to_string(),
+                regex: "(?i)PRODKERNEL:".to_string(),
                 priority: 750,
             },
             crate::settings::PriorityRule {
@@ -12026,6 +12080,10 @@ mod tests {
 
         assert_eq!(
             Database::calculate_priority("PRODKERNEL: perf updates", &compiled_rules),
+            Some(750)
+        );
+        assert_eq!(
+            Database::calculate_priority("[PATCH v2 1/3] PRODKERNEL: fix race", &compiled_rules),
             Some(750)
         );
         assert_eq!(

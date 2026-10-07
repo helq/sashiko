@@ -701,7 +701,6 @@ async fn run_daemon(
         error!("Refusing to start: {}", reason);
         return Err(reason.into());
     }
-
     if let Err(reason) = settings.validate_sign_in_delivery() {
         error!("Refusing to start: {}", reason);
         return Err(reason.into());
@@ -716,6 +715,17 @@ async fn run_daemon(
         return Err(reason.into());
     }
 
+    let mut compiled_rules = Vec::new();
+    for rule in &settings.review.priority_rules {
+        match rule.compile() {
+            Ok(r) => compiled_rules.push(r),
+            Err(e) => {
+                error!("Invalid priority rule regex '{}': {}", rule.regex, e);
+                return Err(format!("Invalid priority rule regex '{}': {}", rule.regex, e).into());
+            }
+        }
+    }
+    let compiled_rules = Arc::new(compiled_rules);
     // Initialize Database
     let db = Arc::new(Database::new(&settings.database).await?);
     db.migrate().await?;
@@ -1100,6 +1110,7 @@ async fn run_daemon(
     let email_policy_path = settings.review.email_policy_path.clone();
     let mut policy =
         sashiko::email_policy::EmailPolicyConfig::load_async(&email_policy_path).await?;
+    let db_rules = compiled_rules.clone();
     let db_worker_handle = tokio::spawn(async move {
         info!("DB Worker started");
 
@@ -1147,8 +1158,15 @@ async fn run_daemon(
                     }
                 };
                 let mut receipt = article.receipt.take();
-                match process_parsed_article(&worker_db, article, git_patch_id, &policy, &mapping)
-                    .await
+                match process_parsed_article(
+                    &worker_db,
+                    article,
+                    git_patch_id,
+                    &policy,
+                    &mapping,
+                    &db_rules,
+                )
+                .await
                 {
                     ProcessStatus::Ingested => {
                         // The article is on disk, so the fetch loop may finally
@@ -3346,6 +3364,7 @@ async fn process_parsed_article(
     git_patch_id: Option<String>,
     policy: &sashiko::email_policy::EmailPolicyConfig,
     subsystem_mapping: &[sashiko::settings::SubsystemMapping],
+    priority_rules: &[sashiko::settings::CompiledPriorityRule],
 ) -> ProcessStatus {
     let ParsedArticle {
         group,
@@ -3751,8 +3770,10 @@ async fn process_parsed_article(
             None
         };
 
+        let priority = sashiko::db::Database::calculate_priority(&subject, priority_rules);
+
         match worker_db
-            .create_patchset(
+            .create_patchset_with_priority(
                 thread_id,
                 cover_letter_id.as_deref(),
                 metadata.message_id.as_str(),
@@ -3772,6 +3793,7 @@ async fn process_parsed_article(
                 strict_author,
                 skip_filters.as_ref(),
                 only_filters.as_ref(),
+                priority,
             )
             .await
         {
