@@ -246,6 +246,9 @@ max_retries = 3
 ignore_files = ["MAINTAINERS", ".mailmap", ".gitignore", "LICENSES/"]
 # effort = "mid"  # Options: "low", "mid" (default for Argon 4), "high", "dynamic"
 
+# Time window (in seconds) for detecting sibling patchset batches (default 30s).
+# batch_window_secs = 30
+
 # Priority rules for patchset queue ordering (evaluated in order; last match wins).
 # Range is 1 to 999. Default priority is 500. Values > 500 are elevated; values < 500 are deprioritized.
 # Note: regex matches the full patchset subject as ingested, which may include prefixes such as [PATCH ...] or #123:.
@@ -256,6 +259,17 @@ ignore_files = ["MAINTAINERS", ".mailmap", ".gitignore", "LICENSES/"]
 # [[review.priority_rules]]
 # regex = "(?i)security"
 # priority = 999
+
+# Automatic batch deprioritization for large submissions.
+# When multiple patchsets arrive within batch_window_secs (default 30s), cap their priority
+# according to threshold tiers to avoid starving individual submissions.
+# [[review.batch_tiers]]
+# min_size = 5
+# priority = 300
+#
+# [[review.batch_tiers]]
+# min_size = 20
+# priority = 100
 
 [linux_bug]
 # Enable pre-existing bug tracking and the background bug worker (default: false).

@@ -301,6 +301,8 @@ pass.
 | `max_total_output_tokens` | integer | `1000000` | Maximum cumulative output tokens (including thinking tokens) per review. Set to 0 to disable. |
 | `effort` | string | `"mid"` (Argon 4) | Reasoning effort mode for models that support configurable effort levels (currently Argon 4; ignored for other models). Options: `"low"` (uniform `Low` effort across all stages), `"mid"` (uniform `Medium` effort across all stages, default), `"high"` (`High` effort across screening, planning, analysis, and verification stages; `Medium` for report formatting), or `"dynamic"` (`Low` for screening/planning/summary, planned `Medium` or `High` per analysis stage, `High` for verification stages, `Medium` for report formatting). Can also be set via `--effort`. |
 | `priority_rules` | list of tables | `[]` | Regex-based rules for patchset queue ordering. |
+| `batch_window_secs` | integer | `30` | Time window (in seconds) for detecting sibling patchset batches. |
+| `batch_tiers` | list of tables | `[]` | Threshold tiers for automatic batch deprioritization. |
 
 #### Priority Rules (`[[review.priority_rules]]`)
 
@@ -325,6 +327,32 @@ priority = 750
 [[review.priority_rules]]
 regex = "(?i)security"
 priority = 999
+```
+
+#### Batch Deprioritization (`[[review.batch_tiers]]`)
+
+When large batches of patchsets arrive simultaneously (such as repository syncs or automated bulk submissions), they can monopolize review worker concurrency and delay individual submissions or urgent fixes. Batch deprioritization automatically detects clusters of sibling patchsets arriving within a configurable sliding window (`batch_window_secs`, default 30 seconds) and caps their effective priority according to configured threshold tiers.
+
+Deprioritization applies retroactively to all patchsets within the window once a tier threshold is crossed, setting `priority = MIN(base_priority, cap)`. This ensures priority is never raised if a patchset was already deprioritized by an earlier rule or manual setting.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `min_size` | integer | -- | Minimum number of sibling patchsets within the batch window required to trigger this tier. |
+| `priority` | integer | -- | Priority cap (1 to 999) enforced on all patchsets in the batch. |
+
+Example:
+
+```toml
+[review]
+batch_window_secs = 30
+
+[[review.batch_tiers]]
+min_size = 5
+priority = 300
+
+[[review.batch_tiers]]
+min_size = 20
+priority = 100
 ```
 
 ### `[linux_bug]`
