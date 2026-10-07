@@ -246,6 +246,17 @@ max_retries = 3
 ignore_files = ["MAINTAINERS", ".mailmap", ".gitignore", "LICENSES/"]
 # effort = "mid"  # Options: "low", "mid" (default for Argon 4), "high", "dynamic"
 
+# Priority rules for patchset queue ordering (evaluated in order; last match wins).
+# Range is 1 to 999. Default priority is 500. Values > 500 are elevated; values < 500 are deprioritized.
+# Note: regex matches the full patchset subject as ingested, which may include prefixes such as [PATCH ...] or #123:.
+# [[review.priority_rules]]
+# regex = "(?i)^PRODKERNEL:"
+# priority = 750
+#
+# [[review.priority_rules]]
+# regex = "(?i)security"
+# priority = 999
+
 [linux_bug]
 # Enable pre-existing bug tracking and the background bug worker (default: false).
 # When disabled, pre-existing issues found during patch review are ignored.
@@ -258,6 +269,4 @@ fix_check_enabled = false
 # fix_check_interval_seconds = 21600
 # Maximum number of open bugs to evaluate per upstream fix check cycle.
 # fix_check_batch_size = 50
-
-
 

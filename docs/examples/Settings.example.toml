@@ -14,3 +14,14 @@ explicit_prompt_caching = false
 # machine; the daemon's own Settings.toml uses a much larger fan-out.
 concurrency = 4
 # effort = "mid"  # Options: "low", "mid" (default for Argon 4), "high", "dynamic"
+
+# Priority rules for patchset queue ordering (evaluated in order; last match wins).
+# Range is 1 to 999. Default priority is 500. Values > 500 are elevated; values < 500 are deprioritized.
+# Note: regex matches the full patchset subject as ingested, which may include prefixes such as [PATCH ...] or #123:.
+# [[review.priority_rules]]
+# regex = "(?i)^PRODKERNEL:"
+# priority = 750
+#
+# [[review.priority_rules]]
+# regex = "(?i)security"
+# priority = 999

@@ -300,6 +300,32 @@ pass.
 | `max_total_tokens` | integer | `10000000` | Maximum cumulative uncached tokens (input + output, including thinking tokens) per review. Cached tokens are excluded. Set to 0 to disable. |
 | `max_total_output_tokens` | integer | `1000000` | Maximum cumulative output tokens (including thinking tokens) per review. Set to 0 to disable. |
 | `effort` | string | `"mid"` (Argon 4) | Reasoning effort mode for models that support configurable effort levels (currently Argon 4; ignored for other models). Options: `"low"` (uniform `Low` effort across all stages), `"mid"` (uniform `Medium` effort across all stages, default), `"high"` (`High` effort across screening, planning, analysis, and verification stages; `Medium` for report formatting), or `"dynamic"` (`Low` for screening/planning/summary, planned `Medium` or `High` per analysis stage, `High` for verification stages, `Medium` for report formatting). Can also be set via `--effort`. |
+| `priority_rules` | list of tables | `[]` | Regex-based rules for patchset queue ordering. |
+
+#### Priority Rules (`[[review.priority_rules]]`)
+
+Priority rules evaluate incoming patchset subjects against regular expressions to set a priority score between 1 and 999. The default priority is 500. Patchsets in the queue are reviewed in descending priority order (`priority DESC, date ASC`), allowing urgent fixes and security patches to be prioritized while deprioritizing routine series under load.
+
+Note that regex patterns match the full patchset subject as ingested, which may include prefixes such as `[PATCH ...]` or `#123:`.
+
+Rules are evaluated in declaration order; the last matching rule determines the priority.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `regex` | string | -- | Regular expression matched against patchset subjects. |
+| `priority` | integer | -- | Assigned priority (1 to 999). Values above 500 elevate; values below 500 deprioritize. |
+
+Example:
+
+```toml
+[[review.priority_rules]]
+regex = "(?i)^PRODKERNEL:"
+priority = 750
+
+[[review.priority_rules]]
+regex = "(?i)security"
+priority = 999
+```
 
 ### `[linux_bug]`
 
