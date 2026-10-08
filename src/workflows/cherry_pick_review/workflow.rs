@@ -27,10 +27,10 @@ use serde_json::{Value, json};
 
 use crate::ai::AiProvider;
 use crate::toolbox::ToolBox;
-use crate::worker::{PromptRegistry, WorkerProgressEvent};
+use crate::worker::{PromptRegistry, WorkerProgressEvent, WorkerResult};
 use crate::workflow::{
     ExecutableStage, OutputFormat, ParallelPolicy, PromptTemplate, RecitationPolicy, Stage,
-    StagePolicy, ToolScope, Workflow, WorkflowEvent,
+    StagePolicy, ToolScope, Workflow, WorkflowEngine, WorkflowEnv, WorkflowEvent,
 };
 use crate::workflows::linux_patch_review;
 
@@ -84,7 +84,6 @@ impl CherryPickReviewWorkflow {
 }
 
 impl CherryPickReviewWorkflow {
-    #[allow(dead_code)]
     async fn build_initial_state(
         &self,
         env: &CherryPickWorkflowEnv<'_>,
@@ -355,6 +354,60 @@ If tool output is truncated ('truncated': true), page only if directly relevant 
     })
 }
 
+/// Execute the cherry-pick review workflow end to end, returning a [`WorkerResult`].
+pub async fn execute_workflow(
+    workflow: &CherryPickReviewWorkflow,
+    env: &CherryPickWorkflowEnv<'_>,
+    patchset: Value,
+    progress: Option<&(dyn Fn(WorkerProgressEvent) + Send + Sync)>,
+) -> Result<WorkerResult> {
+    let mut state = workflow.build_initial_state(env, &patchset).await?;
+
+    let workflow_def = build_cherry_pick_workflow(env.max_interactions, env.temperature);
+
+    let wf_env = WorkflowEnv {
+        provider: env.provider.clone(),
+        tools: env.tools.clone(),
+        base_dir: &env.prompts.base_dir,
+        context_tag: env.context_tag.clone(),
+    };
+
+    let event_cb = |event: WorkflowEvent| handle_workflow_progress(event, progress);
+
+    let outcome =
+        WorkflowEngine::execute(&workflow_def, &wf_env, &mut state, Some(&event_cb)).await?;
+
+    let final_output = build_final_output(&state);
+
+    let mut logged_history = outcome.history;
+    if !logged_history.is_empty() {
+        let logged_system = cherry_pick_system_prompt(true).render_for_log(&state);
+        logged_history.insert(
+            0,
+            crate::ai::AiMessage {
+                role: crate::ai::AiRole::System,
+                content: Some(logged_system),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        );
+    }
+
+    Ok(WorkerResult {
+        output: Some(final_output),
+        error: None,
+        input_context: "Workflow 'cherry-pick' completed".to_string(),
+        history: logged_history.clone(),
+        history_before_pruning: logged_history.clone(),
+        history_after_pruning: logged_history,
+        tokens_in: outcome.tokens_in,
+        tokens_out: outcome.tokens_out,
+        tokens_cached: outcome.tokens_cached,
+    })
+}
+
 #[allow(dead_code)]
 async fn read_bounded_git_output(
     mut child: tokio::process::Child,
@@ -481,7 +534,6 @@ fn map_stage_name(name: &str) -> Option<String> {
     }
 }
 
-#[allow(dead_code)]
 fn handle_workflow_progress(
     event: WorkflowEvent,
     progress: Option<&(dyn Fn(WorkerProgressEvent) + Send + Sync)>,
@@ -527,7 +579,6 @@ fn handle_workflow_progress(
     }
 }
 
-#[allow(dead_code)]
 fn build_final_output(state: &CherryPickState) -> Value {
     json!({
         "findings": state.findings.clone().unwrap_or_else(|| Value::Array(Vec::new())),
@@ -547,7 +598,6 @@ fn build_final_output(state: &CherryPickState) -> Value {
     })
 }
 
-#[allow(dead_code)]
 fn build_cherry_pick_workflow(max_turns: usize, temperature: f32) -> Workflow<CherryPickState> {
     let planner = build_planning_stage();
     let resolver = build_analysis_resolver(max_turns, temperature);
