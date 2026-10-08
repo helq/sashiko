@@ -616,3 +616,57 @@ fn format_stage_origin_feedback(violation: &str) -> String {
         msg
     )
 }
+#[allow(dead_code)]
+fn format_stage10_feedback(violation: &str) -> String {
+    format!(
+        "\n\nPrevious attempt was rejected: {}. You MUST return ONLY a JSON object containing 'findings' array.",
+        violation
+    )
+}
+
+#[allow(dead_code)]
+fn validate_inline_format(content: &str, _state: &CherryPickState) -> Result<(), String> {
+    if content.lines().any(|l| l.trim_start().starts_with("```")) {
+        return Err("The output contains Markdown code blocks ('```'). It must be plain text as per `inline-template.md`.".to_string());
+    }
+    if !content.lines().any(|l| l.trim_start().starts_with('>')) {
+        return Err("The output does not appear to quote any code or context using '>'. Please follow the quoting style in `inline-template.md`.".to_string());
+    }
+    let has_commit_header = content
+        .lines()
+        .take(20)
+        .any(|l| l.trim_start().to_lowercase().starts_with("commit "));
+    if !has_commit_header {
+        return Err("The output is missing the 'commit <hash>' header. Please start with the commit details (Commit, Author, Subject) as per `inline-template.md`.".to_string());
+    }
+    let has_author_header = content
+        .lines()
+        .take(20)
+        .any(|l| l.trim_start().to_lowercase().starts_with("author:"));
+    if !has_author_header {
+        return Err("The output is missing the 'Author: <name>' header. Please start with the commit details (Commit, Author, Subject) as per `inline-template.md`.".to_string());
+    }
+    let has_comments = content.lines().any(|l| {
+        let trimmed = l.trim();
+        if trimmed.is_empty() || trimmed.starts_with('>') {
+            return false;
+        }
+        let lower = trimmed.to_lowercase();
+        !lower.starts_with("commit ")
+            && !lower.starts_with("author:")
+            && !lower.starts_with("date:")
+            && !lower.starts_with("link:")
+    });
+    if !has_comments {
+        return Err("The output appears to lack any comments or summary. You must include a summary and interspersed comments explaining the findings.".to_string());
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn format_stage11_feedback(violation: &str) -> String {
+    format!(
+        "Previous attempt was rejected: {}. Please correct your output format.",
+        violation
+    )
+}
