@@ -75,7 +75,7 @@ impl CherryPickReviewWorkflow {
         self
     }
 
-    #[allow(dead_code, unused_variables)]
+    #[allow(dead_code)]
     async fn build_initial_state(
         &self,
         env: &CherryPickWorkflowEnv<'_>,
@@ -168,12 +168,59 @@ impl CherryPickReviewWorkflow {
             }
         };
 
+        let prefetched_context = match crate::worker::prefetch::prefetch_context(
+            worktree,
+            &self.resolution_sha,
+            &resolution_diff,
+        )
+        .await
+        {
+            Ok(prefetched) => prefetched,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to prefetch context for {}: {}",
+                    self.resolution_sha,
+                    e
+                );
+                String::new()
+            }
+        };
+
+        let planned_stages = env
+            .stages
+            .clone()
+            .unwrap_or_else(|| vec![1, 2, 3, 4, 5, 6, 7]);
+
+        let original_diff =
+            crate::ai::truncator::Truncator::truncate_diff(&original_diff, 20_000, "Diff").content;
+        let resolution_diff =
+            crate::ai::truncator::Truncator::truncate_diff(&resolution_diff, 20_000, "Diff")
+                .content;
+        let resolution_diff_with_log = crate::ai::truncator::Truncator::truncate_diff(
+            &resolution_diff_with_log,
+            20_000,
+            "Diff",
+        )
+        .content;
+
+        let unknown = "(unknown)";
+        let original_subject = original_subject.unwrap_or_else(|| unknown.to_string());
+        let base_subject = base_subject.unwrap_or_else(|| unknown.to_string());
+        let resolution_subject = resolution_subject.unwrap_or_else(|| unknown.to_string());
         Ok(CherryPickState {
             original_sha: self.original_sha.clone(),
+            original_subject,
+            base_sha: resolved_base_sha.unwrap_or_else(|| unknown.to_string()),
+            base_subject,
             resolution_sha: self.resolution_sha.clone(),
+            resolution_subject,
             original_diff,
             target_commit: resolution_diff_with_log,
             target_commit_diff: resolution_diff,
+            prefetched_context,
+            manual_stages: env.stages.clone(),
+            planned_stages,
+            custom_prompt: env.custom_prompt.clone(),
             ..Default::default()
         })
     }
