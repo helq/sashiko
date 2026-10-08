@@ -14,3 +14,16 @@
 
 /// Output format guidance appended to analysis stage prompts.
 pub const ANALYSIS_FORMAT_GUIDANCE: &str = include_str!("prompts/analysis_format_guidance.md");
+
+/// Framing header for merge-conflict resolution review context.
+pub const MERGE_CONFLICT_REVIEW_FRAMING: &str =
+    include_str!("prompts/merge_conflict_review_framing.md");
+
+/// Planning stage instructions for cherry-pick review.
+pub const PLANNING: &str = include_str!("prompts/planning.md");
+
+/// Header for prefetched AST context block.
+pub const PREFETCHED_CONTEXT_HEADER: &str = include_str!("prompts/prefetched_context_header.md");
+
+/// Stage 1 (analysis): semantic-intent preservation of the resolution.
+pub const SEMANTIC_INTENT: &str = include_str!("prompts/semantic_intent.md");
