@@ -35,9 +35,9 @@ use crate::workflows::linux_patch_review;
 
 use super::prompts::{
     ANALYSIS_FORMAT_GUIDANCE, CHERRY_PICK_CONFLICT_RESOLUTION_INSTRUCTION,
-    CHERRY_PICK_DEDUPLICATION_INSTRUCTION, DROPPED_CHANGES, MERGE_CONFLICT_REVIEW_FRAMING,
-    MERGE_CORRECTNESS, ORIGIN_CLASSIFICATION, PLANNING, PREFETCHED_CONTEXT_HEADER, SEMANTIC_INTENT,
-    VERIFICATION,
+    CHERRY_PICK_DEDUPLICATION_INSTRUCTION, CONFLICT_REPORT, DROPPED_CHANGES,
+    MERGE_CONFLICT_REVIEW_FRAMING, MERGE_CORRECTNESS, ORIGIN_CLASSIFICATION, PLANNING,
+    PREFETCHED_CONTEXT_HEADER, SEMANTIC_INTENT, VERIFICATION,
 };
 use super::synthesis;
 
@@ -998,6 +998,32 @@ fn format_stage10_feedback(violation: &str) -> String {
 }
 
 #[allow(dead_code)]
+fn build_stage12(max_turns: usize, temperature: f32) -> Stage<CherryPickState, String> {
+    Stage::builder("12")
+        .system_prompt(cherry_pick_system_prompt(true))
+        .user_prompt(
+            PromptTemplate::new("{{user}}\n\n@include(\"inline-template.md\")")
+                .with_var("user", move |s: &CherryPickState| {
+                    (synthesis::stage11_builder())(CONFLICT_REPORT, s).0
+                })
+                .include_file("inline-template.md"),
+        )
+        .output_format(OutputFormat::text_with_validator(
+            validate_inline_format,
+            format_stage12_feedback,
+        ))
+        .tools(ToolScope::All)
+        .max_turns(max_turns)
+        .temperature(temperature)
+        .on_recitation(RecitationPolicy::FallbackToFreeForm {
+            reminder: "\n\nCRITICAL: The previous attempt failed due to a RECITATION policy violation. Keep the required 'commit <hash>' and 'Author:' headers and use '>' only for short single-line location anchors (such as the file path or function signature), but do NOT quote multi-line code hunks verbatim from the patch. Start your report with a note explaining that the format is altered due to recitation restrictions, and paraphrase the findings in your own words.".to_string(),
+        })
+        .reduce(|state: &mut CherryPickState, text: String| {
+            state.review_inline = Some(text);
+        })
+        .build()
+}
+
 fn validate_inline_format(content: &str, _state: &CherryPickState) -> Result<(), String> {
     if content.lines().any(|l| l.trim_start().starts_with("```")) {
         return Err("The output contains Markdown code blocks ('```'). It must be plain text as per `inline-template.md`.".to_string());
@@ -1036,8 +1062,7 @@ fn validate_inline_format(content: &str, _state: &CherryPickState) -> Result<(),
     Ok(())
 }
 
-#[allow(dead_code)]
-fn format_stage11_feedback(violation: &str) -> String {
+fn format_stage12_feedback(violation: &str) -> String {
     format!(
         "Previous attempt was rejected: {}. Please correct your output format.",
         violation
