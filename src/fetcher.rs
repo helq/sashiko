@@ -337,6 +337,79 @@ impl FetchWorker {
         }
         Ok(())
     }
+
+    /// Extract patch(es) for the row and emit PatchSubmitted events.
+    #[allow(dead_code)]
+    async fn ingest(&self, row: &FetchQueueRow) -> Result<()> {
+        let article_id = Self::article_id_for(row);
+        let mr_url = row.mr_url.clone();
+        let mr_title = row.mr_title.clone();
+
+        if row.commit_hash.contains("..") {
+            let shas = crate::git_ops::resolve_git_range(&self.repo_path, &row.commit_hash).await?;
+            if shas.is_empty() {
+                return Err(PermanentFetchError(format!(
+                    "Commit range {} resolved to zero commits",
+                    row.commit_hash
+                ))
+                .into());
+            }
+            let count = shas.len() as u32;
+            for (i, sha) in shas.iter().enumerate() {
+                let mut event = self
+                    .extract_patch(
+                        sha,
+                        &article_id,
+                        (i + 1) as u32,
+                        count,
+                        mr_url.as_ref(),
+                        mr_title.as_ref(),
+                        row.mr_number,
+                    )
+                    .await?;
+                if let Event::PatchSubmitted {
+                    ref mut message_id, ..
+                } = event
+                {
+                    *message_id = sha.clone();
+                }
+                self.main_tx
+                    .send(event)
+                    .await
+                    .map_err(|e| anyhow!("failed to send event: {}", e))?;
+            }
+            info!("Submitted range {}", row.commit_hash);
+        } else {
+            let full_sha = self.resolve_sha(&row.commit_hash).await?;
+            if row.patchset_id.is_none() && self.db.has_patchset_by_msgid(&full_sha).await? {
+                info!("Skipping already ingested single patch {}", full_sha);
+                return Ok(());
+            }
+            let mut event = self
+                .extract_patch(
+                    &full_sha,
+                    &article_id,
+                    1,
+                    1,
+                    mr_url.as_ref(),
+                    mr_title.as_ref(),
+                    row.mr_number,
+                )
+                .await?;
+            if let Event::PatchSubmitted {
+                ref mut message_id, ..
+            } = event
+            {
+                *message_id = full_sha.clone();
+            }
+            self.main_tx
+                .send(event)
+                .await
+                .map_err(|e| anyhow!("failed to send event: {}", e))?;
+            info!("Submitted patch {}", row.commit_hash);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
