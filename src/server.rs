@@ -603,9 +603,9 @@ async fn submit_patch(
             sha,
             original_sha,
             base_sha,
-            repo: _,
-            skip_subjects: _,
-            only_subjects: _,
+            repo,
+            skip_subjects,
+            only_subjects,
         } => {
             if !is_valid_git_ref(&sha)
                 || !is_valid_git_ref(&original_sha)
@@ -647,7 +647,7 @@ async fn submit_patch(
             };
 
             let id = sha.clone();
-            let _already_ingested = match state.db.find_patchset_id_by_msgid(&id).await {
+            let already_ingested = match state.db.find_patchset_id_by_msgid(&id).await {
                 Ok(Some(existing_id)) => {
                     if !is_authorized(
                         &state,
@@ -725,6 +725,52 @@ async fn submit_patch(
                     return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
                 }
             };
+
+            let repo_display = repo
+                .as_deref()
+                .map(crate::utils::redact_secret)
+                .unwrap_or_else(|| "local".to_string());
+            info!(
+                "Received cherry-pick review request: {} (original {}) from {}",
+                sha, original_sha, repo_display
+            );
+
+            if !already_ingested {
+                // Create a placeholder record so the user can track status.
+                let cover_id = format!("{}@sashiko.local", id);
+                let patchset_id = match state
+                    .db
+                    .create_fetching_patchset(
+                        &cover_id,
+                        &format!("Fetching cherry-pick {} from {}...", sha, repo_display),
+                        skip_subjects.as_ref(),
+                        only_subjects.as_ref(),
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                {
+                    Ok(pid) => pid,
+                    Err(e) => {
+                        error!("Failed to create placeholder patchset: {}", e);
+                        return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                    }
+                };
+
+                if let Err(e) = state
+                    .db
+                    .set_review_context(patchset_id, &review_context_json)
+                    .await
+                {
+                    error!(
+                        "Failed to persist review_context for {}: {}",
+                        patchset_id, e
+                    );
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                }
+            }
 
             Err(StatusCode::NOT_IMPLEMENTED.into_response())
         }
