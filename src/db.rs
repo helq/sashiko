@@ -6657,7 +6657,9 @@ impl Database {
         // 1. Try to find by cover_letter_message_id first (handles placeholders from API/Fetcher)
         let mut clid_candidates = Vec::new();
         if let Some(clid) = cover_letter_message_id {
-            clid_candidates.push((clid.to_string(), false));
+            for c in Self::get_msgid_candidates(clid) {
+                clid_candidates.push((c, false));
+            }
         }
         // Fallback for single-patch git imports where placeholder is
         // sha@sashiko.local but the actual cover letter becomes the sha
@@ -6667,8 +6669,12 @@ impl Database {
         // and the fallback would incorrectly match patchsets from
         // unrelated submissions that happen to share a commit SHA.
         if cover_letter_message_id.is_none() || total_parts == 1 {
-            clid_candidates.push((format!("{}@sashiko.local", message_id), true));
+            for c in Self::get_msgid_candidates(&format!("{}@sashiko.local", message_id)) {
+                clid_candidates.push((c, true));
+            }
         }
+        let mut seen = std::collections::HashSet::new();
+        clid_candidates.retain(|(c, _)| seen.insert(c.clone()));
 
         for (clid, scope_to_thread) in clid_candidates {
             // When using the @sashiko.local fallback, scope the query
