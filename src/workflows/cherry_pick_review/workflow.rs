@@ -963,6 +963,28 @@ fn format_stage1_to_7_feedback(violation: &str) -> String {
     )
 }
 
+pub(crate) fn stage8_reduce(state: &mut CherryPickState, val: &Value) {
+    if let Some(arr) = val.get("concerns").and_then(|v| v.as_array()) {
+        state.concerns = arr.clone();
+    }
+    if let Some(arr) = val.get("dismissed_concerns").and_then(|v| v.as_array()) {
+        state.dismissed_concerns = arr.clone();
+    }
+}
+
+pub(crate) fn stage9_reduce(state: &mut CherryPickState, val: &Value) {
+    if let Some(arr) = val.get("concerns").and_then(|v| v.as_array()) {
+        state.concerns = arr.clone();
+    }
+    if let Some(arr) = val.get("dismissed_concerns").and_then(|v| v.as_array()) {
+        for item in arr {
+            if !state.dismissed_concerns.contains(item) {
+                state.dismissed_concerns.push(item.clone());
+            }
+        }
+    }
+}
+
 fn build_stage8(max_turns: usize, temperature: f32) -> Stage<CherryPickState, Value> {
     Stage::builder("8")
         .system_prompt(cherry_pick_system_prompt(true))
@@ -982,12 +1004,7 @@ fn build_stage8(max_turns: usize, temperature: f32) -> Stage<CherryPickState, Va
         .temperature(temperature)
         .on_recitation(recitation_reminder())
         .reduce(|state: &mut CherryPickState, val: Value| {
-            if let Some(arr) = val.get("concerns").and_then(|v| v.as_array()) {
-                state.concerns = arr.clone();
-            }
-            if let Some(arr) = val.get("dismissed_concerns").and_then(|v| v.as_array()) {
-                state.dismissed_concerns = arr.clone();
-            }
+            stage8_reduce(state, &val);
         })
         .build()
 }
@@ -1011,16 +1028,7 @@ fn build_stage9(max_turns: usize, temperature: f32) -> Stage<CherryPickState, Va
         .temperature(temperature)
         .on_recitation(recitation_reminder())
         .reduce(|state: &mut CherryPickState, val: Value| {
-            if let Some(arr) = val.get("concerns").and_then(|v| v.as_array()) {
-                state.concerns = arr.clone();
-            }
-            if let Some(arr) = val.get("dismissed_concerns").and_then(|v| v.as_array()) {
-                for item in arr {
-                    if !state.dismissed_concerns.contains(item) {
-                        state.dismissed_concerns.push(item.clone());
-                    }
-                }
-            }
+            stage9_reduce(state, &val);
         })
         .build()
 }
@@ -1550,12 +1558,7 @@ mod tests {
                 {"title": "d1", "description": "dismissed in stage 8"}
             ]
         });
-        if let Some(arr) = s8_val.get("concerns").and_then(|v| v.as_array()) {
-            state.concerns = arr.clone();
-        }
-        if let Some(arr) = s8_val.get("dismissed_concerns").and_then(|v| v.as_array()) {
-            state.dismissed_concerns = arr.clone();
-        }
+        stage8_reduce(&mut state, &s8_val);
         assert_eq!(state.concerns.len(), 1);
         assert_eq!(state.concerns[0]["title"], "c1_dedup");
         assert_eq!(state.dismissed_concerns.len(), 1);
@@ -1571,16 +1574,7 @@ mod tests {
                 {"title": "d2", "description": "dismissed in stage 9"}
             ]
         });
-        if let Some(arr) = s9_val.get("concerns").and_then(|v| v.as_array()) {
-            state.concerns = arr.clone();
-        }
-        if let Some(arr) = s9_val.get("dismissed_concerns").and_then(|v| v.as_array()) {
-            for item in arr {
-                if !state.dismissed_concerns.contains(item) {
-                    state.dismissed_concerns.push(item.clone());
-                }
-            }
-        }
+        stage9_reduce(&mut state, &s9_val);
         assert_eq!(state.concerns.len(), 1);
         assert_eq!(state.concerns[0]["title"], "c1_resolved");
         assert_eq!(state.dismissed_concerns.len(), 2);
