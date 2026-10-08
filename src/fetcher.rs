@@ -244,6 +244,36 @@ impl FetchWorker {
         }
     }
 
+    /// Process a single claimed fetch: ensure the commits are present locally
+    /// (fetching from the remote if needed), extract the patch(es), and emit the
+    /// corresponding events. On any failure the row is retried with backoff, or
+    /// failed terminally once the retry window is exhausted.
+    #[allow(dead_code)]
+    async fn process_row(&self, row: FetchQueueRow) {
+        info!(
+            "Processing fetch {} (commit {}, attempt {})",
+            row.id, row.commit_hash, row.attempts
+        );
+
+        if let Err(e) = self.ensure_present(&row).await {
+            self.handle_failure(&row, e.context("fetch failed")).await;
+            return;
+        }
+
+        match self.ingest(&row).await {
+            Ok(()) => {
+                if let Err(e) = self.db.mark_fetch_done(row.id).await {
+                    error!("Failed to mark fetch {} done: {}", row.id, e);
+                } else {
+                    info!("Fetch complete for {}", row.commit_hash);
+                }
+            }
+            Err(e) => {
+                self.handle_failure(&row, e.context("extract failed")).await;
+            }
+        }
+    }
+
     /// Ensure every commit referenced by the row exists locally, fetching from
     /// the remote when necessary.
     #[allow(dead_code)]
