@@ -2366,7 +2366,7 @@ async fn forge_webhook(
         format!("{}-{}", repo, metadata.pr_number)
     });
 
-    state
+    let patchset_id = state
         .db
         .create_fetching_patchset(
             &placeholder_id,
@@ -2377,7 +2377,7 @@ async fn forge_webhook(
             Some(subject),
             Some(metadata.pr_number),
             slug.as_deref(),
-            None,
+            metadata.repo_url.as_deref(),
             None,
         )
         .await
@@ -2386,18 +2386,31 @@ async fn forge_webhook(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         })?;
 
-    let req = FetchRequest {
-        repo_url: metadata.repo_url,
-        commit_hash: commit_range,
-        mr_url: metadata.pr_url,
-        mr_title: metadata.pr_title,
-        mr_number: Some(metadata.pr_number),
-    };
-
-    state.fetch_sender.send(req).await.map_err(|e| {
-        error!("Failed to send fetch request to queue: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR.into_response()
-    })?;
+    // Persist the fetch durably; the FetchWorker will pick it up.
+    if let Err(e) = state
+        .db
+        .enqueue_fetch(
+            Some(patchset_id),
+            Some(&placeholder_id),
+            metadata.repo_url.as_deref(),
+            &commit_range,
+            metadata.pr_url.as_deref(),
+            metadata.pr_title.as_deref(),
+            Some(metadata.pr_number),
+            500,
+        )
+        .await
+    {
+        error!("Failed to enqueue fetch request: {}", e);
+        if let Err(err) = state
+            .db
+            .update_patchset_error(&placeholder_id, &format!("Failed to enqueue fetch: {}", e))
+            .await
+        {
+            error!("Failed to mark patchset {} failed: {}", placeholder_id, err);
+        }
+        return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
 
     Ok(Json(serde_json::json!({
         "status": "accepted",
