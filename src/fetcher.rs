@@ -520,76 +520,6 @@ impl FetchAgent {
                         }
                     }
                     info!("Successfully submitted remote range {}", range);
-                } else {
-                    // Single commit
-                    let full_sha = match self.resolve_sha(&commit_or_range).await {
-                        Ok(sha) => sha,
-                        Err(e) => {
-                            let _ = self
-                                .main_tx
-                                .send(Event::IngestionFailed {
-                                    article_id: commit_or_range.clone(),
-                                    error: format!(
-                                        "Failed to resolve SHA: {}",
-                                        redact_secret(&e.to_string())
-                                    ),
-                                    source: MessageSource::GitFetch,
-                                })
-                                .await;
-                            continue;
-                        }
-                    };
-
-                    let (mr_url, mr_title, mr_number) = self
-                        .mr_metadata
-                        .get(&commit_or_range)
-                        .cloned()
-                        .unwrap_or((None, None, None));
-
-                    let article_id = if let Some(number) = mr_number {
-                        format!("mr-{}-{}", number, commit_or_range)
-                    } else {
-                        commit_or_range.clone()
-                    };
-
-                    match self
-                        .extract_patch(
-                            &full_sha,
-                            &article_id,
-                            1,
-                            1,
-                            mr_url.as_ref(),
-                            mr_title.as_ref(),
-                            mr_number,
-                        )
-                        .await
-                    {
-                        Ok(mut event) => {
-                            if let Event::PatchSubmitted {
-                                ref mut message_id, ..
-                            } = event
-                            {
-                                *message_id = full_sha.clone();
-                            }
-                            if let Err(e) = self.main_tx.send(event).await {
-                                error!("Failed to send PatchSubmitted event: {}", e);
-                            } else {
-                                info!("Successfully submitted remote patch {}", commit_or_range);
-                            }
-                        }
-                        Err(e) => {
-                            let err_msg = redact_secret(&e.to_string());
-                            error!("Failed to extract patch {}: {}", commit_or_range, err_msg);
-                            let _ = self
-                                .main_tx
-                                .send(Event::IngestionFailed {
-                                    article_id: commit_or_range,
-                                    error: format!("Failed to extract patch: {}", err_msg),
-                                    source: MessageSource::GitFetch,
-                                })
-                                .await;
-                        }
-                    }
                 }
             }
         }
@@ -861,6 +791,7 @@ impl FetchAgent {
         }
     }
 
+    #[allow(dead_code)]
     async fn resolve_sha(&self, commit: &str) -> Result<String> {
         let output = crate::git_cmd::in_dir_async(&self.repo_path)
             .args(["-c", "safe.bareRepository=all"])
