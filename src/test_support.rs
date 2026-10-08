@@ -14,6 +14,9 @@
 
 //! Helpers for tests in more than one module.
 
+#[path = "test_support/replay.rs"]
+pub mod replay;
+
 use std::path::Path;
 
 /// Writes `content` to `path` as an executable script for a test to run.
@@ -27,7 +30,7 @@ use std::path::Path;
 /// So the content goes to a sibling file that is never executed, and a child
 /// process installs the script from it. That child's descriptor closes when
 /// it exits, and this process never holds one on the script to be inherited.
-pub(crate) fn write_executable_script(path: &Path, content: &str) {
+pub fn write_executable_script(path: &Path, content: &str) {
     let source = path.with_extension("source");
     std::fs::write(&source, content).expect("write the script's source");
     let status = std::process::Command::new("install")
