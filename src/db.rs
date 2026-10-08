@@ -9882,6 +9882,65 @@ impl Database {
         Ok(())
     }
 
+    /// Atomically claim the highest-priority due fetch, leasing it to the caller
+    /// and bumping its attempt count. Fresh rows (lower attempts) are claimed
+    /// ahead of retrying rows so failing fetches cannot starve newly enqueued
+    /// work. Returns None if nothing is due.
+    pub async fn lock_pending_fetch(&self) -> Result<Option<FetchQueueRow>> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+
+        let mut rows = self
+            .conn
+            .query(
+                "UPDATE fetch_queue \
+                 SET status = 'Fetching', locked_at = ?, attempts = attempts + 1, \
+                     first_attempt_at = COALESCE(first_attempt_at, ?) \
+                 WHERE id = ( \
+                     SELECT id FROM fetch_queue \
+                     WHERE status = 'Pending' \
+                       AND (next_retry_at IS NULL OR next_retry_at <= ?) \
+                     ORDER BY attempts ASC, priority DESC, created_at ASC LIMIT 1 \
+                 ) \
+                 RETURNING id, patchset_id, cover_letter_message_id, repo_url, \
+                     commit_hash, mr_url, mr_title, mr_number, status, attempts, \
+                     first_attempt_at, next_retry_at, locked_at, last_error, \
+                     priority, created_at",
+                libsql::params![now, now, now],
+            )
+            .await?;
+
+        if let Some(row) = rows.next().await? {
+            let row = Self::row_to_fetch_queue(&row)?;
+            Ok(Some(row))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn row_to_fetch_queue(row: &libsql::Row) -> Result<FetchQueueRow> {
+        Ok(FetchQueueRow {
+            id: row.get(0)?,
+            patchset_id: row.get::<Option<i64>>(1)?,
+            cover_letter_message_id: row.get::<Option<String>>(2)?,
+            repo_url: row.get::<Option<String>>(3)?,
+            commit_hash: row.get(4)?,
+            mr_url: row.get::<Option<String>>(5)?,
+            mr_title: row.get::<Option<String>>(6)?,
+            mr_number: row.get::<Option<i64>>(7)?,
+            status: row.get::<String>(8)?.parse()?,
+            attempts: row.get(9)?,
+            first_attempt_at: row.get::<Option<i64>>(10)?,
+            next_retry_at: row.get::<Option<i64>>(11)?,
+            locked_at: row.get::<Option<i64>>(12)?,
+            last_error: row.get::<Option<String>>(13)?,
+            priority: row.get(14)?,
+            created_at: row.get(15)?,
+            supporting_commits: Vec::new(),
+        })
+    }
+
     pub async fn has_patchset_by_msgid(&self, msgid: &str) -> Result<bool> {
         let candidates = Self::get_msgid_candidates(msgid);
         for clid in &candidates {
