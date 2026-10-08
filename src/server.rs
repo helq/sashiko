@@ -554,11 +554,12 @@ async fn submit_patch(
             }
 
             // Create a placeholder record in the DB so the user can track status
-            if let Err(e) = state
+            let cover_id = format!("{}@sashiko.local", id);
+            let patchset_id = match state
                 .db
                 .create_fetching_patchset(
-                    &format!("{}@sashiko.local", id),
-                    &format!("Fetching {} from {}...", sha, repo_display),
+                    &cover_id,
+                    &format!("Fetching {} from {}...", &sha, repo_display),
                     skip_subjects.as_ref(),
                     only_subjects.as_ref(),
                     None,
@@ -570,20 +571,36 @@ async fn submit_patch(
                 )
                 .await
             {
-                error!("Failed to create placeholder patchset: {}", e);
-                return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
-            }
-
-            let req = FetchRequest {
-                repo_url: repo,
-                commit_hash: sha,
-                mr_url: None,
-                mr_title: None,
-                mr_number: None,
+                Ok(pid) => pid,
+                Err(e) => {
+                    error!("Failed to create placeholder patchset: {}", e);
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                }
             };
 
-            if let Err(e) = state.fetch_sender.send(req).await {
-                error!("Failed to send fetch request to queue: {}", e);
+            // Persist the fetch durably; the FetchWorker will pick it up.
+            if let Err(e) = state
+                .db
+                .enqueue_fetch(
+                    Some(patchset_id),
+                    Some(&cover_id),
+                    repo.as_deref(),
+                    &sha,
+                    None,
+                    None,
+                    None,
+                    500,
+                )
+                .await
+            {
+                error!("Failed to enqueue fetch request: {}", e);
+                if let Err(err) = state
+                    .db
+                    .update_patchset_error(&cover_id, &format!("Failed to enqueue fetch: {}", e))
+                    .await
+                {
+                    error!("Failed to mark patchset {} failed: {}", cover_id, err);
+                }
                 return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
             }
 
