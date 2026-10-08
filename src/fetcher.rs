@@ -25,28 +25,21 @@ use tokio::time::{Duration, interval};
 use tracing::{error, info, warn};
 
 /// How often the worker polls the durable queue for due work.
-#[allow(dead_code)]
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// How often expired leases from dead workers are reclaimed.
-#[allow(dead_code)]
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// A claimed fetch whose worker stops updating it for this long is treated as a
 /// ghost and reclaimed by the sweep.
-#[allow(dead_code)]
 const GHOST_LEASE_SECS: i64 = 600;
 /// Total wall-clock window a fetch keeps retrying before it is failed.
-#[allow(dead_code)]
 const RETRY_WINDOW_SECS: i64 = 24 * 60 * 60;
 /// First retry delay; subsequent delays double up to BACKOFF_CAP_SECS.
-#[allow(dead_code)]
 const BACKOFF_BASE_SECS: i64 = 30;
 /// Maximum delay between retries.
-#[allow(dead_code)]
 const BACKOFF_CAP_SECS: i64 = 600;
 
 /// Maximum number of fetch_queue rows to claim and pre-fetch in a single
 /// `git fetch` call. Batching improves server-side pack negotiation.
-#[allow(dead_code)]
 const BATCH_SIZE: usize = 20;
 
 /// Marker error for failures that can never succeed on retry (e.g. a commit
@@ -54,7 +47,6 @@ const BATCH_SIZE: usize = 20;
 /// backoff retry window and fail the fetch immediately, mirroring the
 /// fast-fail behaviour of the old in-memory FetchAgent.
 #[derive(Debug)]
-#[allow(dead_code)]
 struct PermanentFetchError(String);
 
 impl std::fmt::Display for PermanentFetchError {
@@ -81,7 +73,6 @@ pub fn commit_hash_from_placeholder(msgid: &str) -> String {
 }
 
 /// Current unix time in seconds.
-#[allow(dead_code)]
 fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -92,7 +83,6 @@ fn now_secs() -> i64 {
 /// Exponential backoff (in seconds) for a given attempt count. `attempts` is the
 /// number of attempts already made (>= 1 after the first claim): 1 -> 30s,
 /// 2 -> 60s, 3 -> 120s, ... capped at BACKOFF_CAP_SECS.
-#[allow(dead_code)]
 fn backoff_secs(attempts: i64) -> i64 {
     let exp = attempts.saturating_sub(1).clamp(0, 20) as u32;
     BACKOFF_BASE_SECS
@@ -103,7 +93,6 @@ fn backoff_secs(attempts: i64) -> i64 {
 /// Whether a revision string is a full git object id (sha1 = 40 hex chars, or
 /// sha256 = 64). Only full object ids can be requested directly via `want`
 /// without a ref lookup; branch/tag names must be resolved by the server.
-#[allow(dead_code)]
 fn looks_like_object_id(rev: &str) -> bool {
     matches!(rev.len(), 40 | 64) && rev.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -138,7 +127,6 @@ pub fn parse_commit_range_endpoints(spec: &str) -> Result<Vec<String>> {
 }
 
 /// RAII guard that aborts a spawned Tokio task on drop.
-#[allow(dead_code)]
 struct TaskAbortGuard(tokio::task::JoinHandle<()>);
 
 impl Drop for TaskAbortGuard {
@@ -155,7 +143,6 @@ impl Drop for TaskAbortGuard {
 /// backoff retry, or (after RETRY_WINDOW_SECS) fails them terminally. Because
 /// all state lives in the database, requests survive restarts and crashed
 /// workers are recovered by the ghost sweep.
-#[allow(dead_code)]
 pub struct FetchWorker {
     repo_path: PathBuf,
     db: Arc<Database>,
@@ -164,7 +151,6 @@ pub struct FetchWorker {
 }
 
 impl FetchWorker {
-    #[allow(dead_code)]
     pub fn new(
         repo_path: PathBuf,
         db: Arc<Database>,
@@ -179,7 +165,6 @@ impl FetchWorker {
         }
     }
 
-    #[allow(dead_code)]
     pub async fn run(self) {
         info!("FetchWorker started");
 
@@ -351,7 +336,6 @@ impl FetchWorker {
     /// (fetching from the remote if needed), extract the patch(es), and emit the
     /// corresponding events. On any failure the row is retried with backoff, or
     /// failed terminally once the retry window is exhausted.
-    #[allow(dead_code)]
     async fn process_row(&self, row: FetchQueueRow, active_idx: &AtomicUsize, next_idx: usize) {
         info!(
             "Processing fetch {} (commit {}, attempt {})",
@@ -383,7 +367,6 @@ impl FetchWorker {
 
     /// Ensure every commit referenced by the row exists locally, fetching from
     /// the remote when necessary.
-    #[allow(dead_code)]
     async fn ensure_present(&self, row: &FetchQueueRow) -> Result<()> {
         // For ranges (base..head, base...head), endpoints must be checked individually.
         let mut to_check = parse_commit_range_endpoints(&row.commit_hash)
@@ -476,7 +459,6 @@ impl FetchWorker {
     }
 
     /// Extract patch(es) for the row and emit PatchSubmitted events.
-    #[allow(dead_code)]
     async fn ingest(&self, row: &FetchQueueRow) -> Result<()> {
         let article_id = Self::article_id_for(row);
         let mr_url = row.mr_url.clone();
@@ -826,10 +808,9 @@ impl FetchWorker {
         Ok(())
     }
 
-    /// Pre-fetch all missing objects across a batch of claimed rows in a single
-    /// git fetch call per remote. This maximizes pack negotiation efficiency so
+    /// Pre-fetch objects for a batch of rows in a single `git fetch` call.
+    /// Groups rows by remote URL and fetches all missing SHAs together so
     /// the server can compute one optimal pack.
-    #[allow(dead_code)]
     async fn batch_prefetch(&self, rows: &[FetchQueueRow]) {
         // Remotes where fewer than two rows have missing commits are skipped so
         // a single failing row is not fetched twice back-to-back (once in
@@ -965,7 +946,6 @@ impl FetchWorker {
         }
     }
 
-    #[allow(dead_code)]
     async fn resolve_sha(&self, commit: &str) -> Result<String> {
         let commit = commit.trim();
         if commit.starts_with('-') {
@@ -998,7 +978,6 @@ impl FetchWorker {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
-    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     async fn extract_patch(
         &self,
