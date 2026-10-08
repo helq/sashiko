@@ -243,6 +243,11 @@ enum Commands {
         /// Include pre-existing bugs in verification and report generation
         #[arg(long, hide = true)]
         report_preexisting: bool,
+
+        /// Alternate review workflow selector as JSON (e.g. the cherry-pick review
+        /// context). Absent selects the default patch-review workflow.
+        #[arg(long)]
+        review_context: Option<String>,
     },
 
     /// Run a benchmark suite against an isolated per-run database
@@ -542,6 +547,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 custom_prompt,
                 agent,
                 report_preexisting,
+                review_context,
                 ..
             } => {
                 std::panic::set_hook(Box::new(|info| {
@@ -556,6 +562,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )),
                 };
 
+                let review_context = review_context
+                    .as_deref()
+                    .map(serde_json::from_str::<sashiko::review_kind::ReviewKind>)
+                    .transpose()
+                    .map_err(Box::<dyn std::error::Error>::from)?;
+
                 let result = run_worker_from_stdin(
                     WorkerOptions {
                         project,
@@ -569,6 +581,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         current_tree: false,
                         agent: *agent,
                         report_preexisting: *report_preexisting,
+                        review_context,
                     },
                     &settings,
                 )

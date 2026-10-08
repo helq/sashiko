@@ -101,6 +101,8 @@ pub struct WorkerConfig {
     pub skip_report: bool,
     pub report_preexisting: bool,
     pub effort: Option<crate::ai::EffortMode>,
+    /// Alternate review workflow selector. `None` = default patch review.
+    pub review_context: Option<crate::review_kind::ReviewKind>,
 }
 
 #[derive(Debug, Clone)]
@@ -1061,6 +1063,7 @@ mod tests {
             skip_report: false,
             report_preexisting: false,
             effort: None,
+            review_context: None,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1172,6 +1175,7 @@ mod tests {
             skip_report: false,
             report_preexisting: false,
             effort: None,
+            review_context: None,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1210,6 +1214,7 @@ mod tests {
             skip_report: false,
             report_preexisting: false,
             effort: None,
+            review_context: None,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1252,6 +1257,7 @@ mod tests {
             skip_report: false,
             report_preexisting: false,
             effort: None,
+            review_context: None,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1355,6 +1361,7 @@ mod tests {
             skip_report: false,
             report_preexisting: false,
             effort: None,
+            review_context: None,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1540,6 +1547,7 @@ mod tests {
                 skip_report: true,
                 report_preexisting: false,
                 effort: None,
+                review_context: None,
             };
             let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1641,6 +1649,7 @@ mod tests {
                 skip_report: false,
                 report_preexisting: false,
                 effort: None,
+                review_context: None,
             },
         );
         let out_default = worker_default
@@ -1673,6 +1682,7 @@ mod tests {
                 skip_report: false,
                 report_preexisting: true,
                 effort: None,
+                review_context: None,
             },
         );
         let out_preexisting = worker_preexisting

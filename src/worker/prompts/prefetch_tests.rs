@@ -93,6 +93,7 @@ async fn review_requests_use_target_prefetch_or_explicit_failure() {
                 skip_report: false,
                 report_preexisting: false,
                 effort: None,
+                review_context: None,
             },
         );
         worker

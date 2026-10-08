@@ -52,6 +52,8 @@ pub struct WorkerOptions {
     pub current_tree: bool,
     pub agent: bool,
     pub report_preexisting: bool,
+    /// Alternate review workflow selector. `None` = default patch review.
+    pub review_context: Option<crate::review_kind::ReviewKind>,
 }
 
 impl Default for WorkerOptions {
@@ -68,6 +70,7 @@ impl Default for WorkerOptions {
             current_tree: false,
             agent: false,
             report_preexisting: false,
+            review_context: None,
         }
     }
 }
@@ -592,6 +595,7 @@ async fn review_single_patch(
                 skip_report: options.agent,
                 report_preexisting: options.report_preexisting,
                 effort: settings.effective_effort(),
+                review_context: options.review_context.clone(),
             },
         );
 
