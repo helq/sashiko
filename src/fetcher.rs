@@ -404,14 +404,6 @@ impl FetchWorker {
         }
     }
 
-    #[allow(dead_code)]
-    fn article_id_for(row: &FetchQueueRow) -> String {
-        match row.mr_number {
-            Some(number) => format!("mr-{}-{}", number, row.commit_hash),
-            None => row.commit_hash.clone(),
-        }
-    }
-
     /// Process a single claimed fetch: ensure the commits are present locally
     /// (fetching from the remote if needed), extract the patch(es), and emit the
     /// corresponding events. On any failure the row is retried with backoff, or
@@ -611,6 +603,12 @@ impl FetchWorker {
             info!("Submitted patch {}", row.commit_hash);
         }
         Ok(())
+    }
+    fn article_id_for(row: &FetchQueueRow) -> String {
+        match row.mr_number {
+            Some(number) => format!("mr-{}-{}", number, row.commit_hash),
+            None => row.commit_hash.clone(),
+        }
     }
     fn get_remote_name(&self, url: &str) -> String {
         // Use a hash of the URL to ensure safe and unique remote names
