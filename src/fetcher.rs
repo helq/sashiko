@@ -318,59 +318,7 @@ impl FetchAgent {
     }
 
     async fn process_queue(&self, queue: &mut HashMap<Option<String>, HashSet<String>>) {
-        info!("Processing fetch queue with {} repos", queue.len());
-
-        for (url_opt, commits) in queue.drain() {
-            if commits.is_empty() {
-                continue;
-            }
-
-            let commit_list: Vec<String> = commits.into_iter().collect();
-            let url_display = url_opt
-                .as_deref()
-                .map(redact_secret)
-                .unwrap_or_else(|| "local".to_string());
-
-            info!(
-                "Processing {} commits for remote {}",
-                commit_list.len(),
-                url_display
-            );
-
-            // For ranges (base..head), we need to check both endpoints individually
-            let mut commits_to_check = Vec::new();
-            for commit_or_range in &commit_list {
-                if commit_or_range.contains("..") {
-                    let parts: Vec<&str> = commit_or_range.split("..").collect();
-                    if parts.len() == 2 {
-                        let base = parts[0];
-                        let head = parts[1].trim_start_matches('.');
-                        if !base.is_empty() {
-                            commits_to_check.push(base.to_string());
-                        }
-                        if !head.is_empty() {
-                            commits_to_check.push(head.to_string());
-                        }
-                    }
-                } else {
-                    commits_to_check.push(commit_or_range.clone());
-                }
-            }
-
-            let mut missing_commits = Vec::new();
-            for commit in &commits_to_check {
-                if !self.is_present(commit).await {
-                    missing_commits.push(commit.clone());
-                }
-            }
-
-            if missing_commits.is_empty() {
-                info!(
-                    "All commits present locally, skipping fetch for {}",
-                    url_display
-                );
-            }
-        }
+        let _ = queue.drain();
     }
 
     fn get_remote_name(&self, url: &str) -> String {
@@ -825,6 +773,39 @@ mod tests {
             agent.is_present(&commit_sha).await,
             "Commit SHA should be considered present"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_process_queue_drains_queue() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let repo_path = temp_dir.path().to_path_buf();
+
+        crate::git_cmd::in_dir_async(&repo_path)
+            .arg("init")
+            .output()
+            .await?;
+
+        let (tx, _rx) = mpsc::channel(10);
+        let (agent, _) = FetchAgent::new(repo_path, tx, None);
+
+        let req = FetchRequest {
+            repo_url: Some("https://oauth2:glpat_secret123@127.0.0.1:0/group/repo.git".to_string()),
+            commit_hash: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+            mr_url: None,
+            mr_title: None,
+            mr_number: None,
+        };
+
+        let mut queue: HashMap<Option<String>, HashSet<String>> = HashMap::new();
+        queue
+            .entry(req.repo_url)
+            .or_default()
+            .insert(req.commit_hash.clone());
+
+        agent.process_queue(&mut queue).await;
+        assert!(queue.is_empty());
 
         Ok(())
     }
