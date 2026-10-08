@@ -607,33 +607,27 @@ async fn submit_patch(
             skip_subjects,
             only_subjects,
         } => {
-            if !is_valid_git_ref(&sha)
-                || !is_valid_git_ref(&original_sha)
-                || base_sha.as_deref().is_some_and(|b| !is_valid_git_ref(b))
+            if sha.contains("..")
+                || original_sha.contains("..")
+                || base_sha.as_deref().is_some_and(|b| b.contains(".."))
             {
-                warn!(
-                    "rejected cherry-pick submit request with invalid git ref: sha={:?}, original={:?}, base={:?}",
-                    sha, original_sha, base_sha
-                );
+                return Err(StatusCode::BAD_REQUEST.into_response());
+            }
+            if !is_valid_git_ref(&sha) || !is_valid_git_ref(&original_sha) {
+                return Err(StatusCode::BAD_REQUEST.into_response());
+            }
+            let base_sha = base_sha.filter(|s| !s.is_empty());
+            if let Some(ref b) = base_sha
+                && !is_valid_git_ref(b)
+            {
+                return Err(StatusCode::BAD_REQUEST.into_response());
+            }
+            if original_sha == sha || base_sha.as_deref().is_some_and(|b| b == sha) {
                 return Err(StatusCode::BAD_REQUEST.into_response());
             }
 
-            if original_sha == sha {
-                warn!(
-                    "rejected cherry-pick submit request where original and resolution SHA match: {}",
-                    sha
-                );
-                return Err(StatusCode::BAD_REQUEST.into_response());
-            }
-
-            if base_sha.as_deref().is_some_and(|b| b == sha) {
-                warn!(
-                    "rejected cherry-pick submit request where base and resolution SHA match: {}",
-                    sha
-                );
-                return Err(StatusCode::BAD_REQUEST.into_response());
-            }
-
+            // Persist the minimal cherry-pick selector; the reviewer forwards it
+            // to the workflow, which hydrates the rest of the context from git.
             let review_context = ReviewKind::CherryPick {
                 original_sha: original_sha.clone(),
                 base_sha: base_sha.clone(),
@@ -645,6 +639,16 @@ async fn submit_patch(
                     return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
                 }
             };
+
+            // The original (and base) commits live on divergent history and are
+            // not reachable from the resolution commit, so git will not pull
+            // them transitively. Fetch them explicitly as supporting commits so
+            // the workflow can hydrate the full three-commit context at review
+            // time; they are fetched but never ingested as separate patches.
+            let mut supporting_commits: Vec<String> = vec![original_sha.clone()];
+            if let Some(ref base) = base_sha {
+                supporting_commits.push(base.clone());
+            }
 
             let id = sha.clone();
             let already_ingested = match state.db.find_patchset_id_by_msgid(&id).await {
@@ -772,7 +776,24 @@ async fn submit_patch(
                 }
             }
 
-            Err(StatusCode::NOT_IMPLEMENTED.into_response())
+            let req = FetchRequest {
+                repo_url: repo,
+                commit_hash: sha,
+                supporting_commits,
+                mr_url: None,
+                mr_title: None,
+                mr_number: None,
+            };
+
+            if let Err(e) = state.fetch_sender.send(req).await {
+                error!("Failed to send fetch request to queue: {}", e);
+                return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            }
+
+            Ok(Json(SubmitResponse {
+                status: "accepted".to_string(),
+                id,
+            }))
         }
         SubmitRequest::Thread { msgid } => {
             let id = generate_synthetic_id("thread");
