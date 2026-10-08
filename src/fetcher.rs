@@ -88,6 +88,35 @@ fn looks_like_object_id(rev: &str) -> bool {
     matches!(rev.len(), 40 | 64) && rev.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// Extract commit endpoints from a commit specifier or range.
+///
+/// Both endpoints of a range must be non-empty (e.g. `base..head` or `base...head`).
+/// Open-ended ranges (e.g. `..head`, `base..`, `...head`, `base...`) are invalid
+/// and rejected with an error.
+pub fn parse_commit_range_endpoints(spec: &str) -> Result<Vec<String>> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return Err(anyhow!("Commit specifier must not be empty"));
+    }
+
+    let (start, end) = if let Some((start, end)) = spec.split_once("...") {
+        (start.trim(), end.trim())
+    } else if let Some((start, end)) = spec.split_once("..") {
+        (start.trim(), end.trim())
+    } else {
+        return Ok(vec![spec.to_string()]);
+    };
+
+    if start.is_empty() || end.is_empty() {
+        return Err(anyhow!(
+            "Invalid range '{}': both start and end must be non-empty",
+            spec
+        ));
+    }
+
+    Ok(vec![start.to_string(), end.to_string()])
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FetchRequest {
     pub repo_url: Option<String>,
@@ -998,5 +1027,26 @@ mod tests {
         assert!(!looks_like_object_id("refs/heads/main"));
         assert!(!looks_like_object_id(&"a".repeat(39)));
         assert!(!looks_like_object_id("zzzz"));
+    }
+
+    #[test]
+    fn test_parse_commit_range_endpoints() {
+        assert_eq!(
+            parse_commit_range_endpoints("abc1234").unwrap(),
+            vec!["abc1234"]
+        );
+        assert_eq!(
+            parse_commit_range_endpoints("v1.0..v2.0").unwrap(),
+            vec!["v1.0", "v2.0"]
+        );
+        assert_eq!(
+            parse_commit_range_endpoints("v1.0...v2.0").unwrap(),
+            vec!["v1.0", "v2.0"]
+        );
+        assert!(parse_commit_range_endpoints("").is_err());
+        assert!(parse_commit_range_endpoints("..head").is_err());
+        assert!(parse_commit_range_endpoints("base..").is_err());
+        assert!(parse_commit_range_endpoints("...head").is_err());
+        assert!(parse_commit_range_endpoints("base...").is_err());
     }
 }
