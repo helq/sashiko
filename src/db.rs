@@ -9950,6 +9950,52 @@ impl Database {
         Ok(out)
     }
 
+    /// Remove a fetch from the queue once it has been successfully processed.
+    ///
+    /// Completed fetches serve no further purpose: idempotency is guaranteed by
+    /// the local git repository (`is_present`), not by queue history, and no code
+    /// path reads `Done` rows (dedup and stuck-placeholder recovery only consider
+    /// `Pending`/`Fetching`). Deleting the row instead of marking it `Done` keeps
+    /// the queue table bounded to in-flight work.
+    pub async fn mark_fetch_done(&self, id: i64) -> Result<()> {
+        // Foreign-key cascade is not enabled on this connection, so remove the
+        // child supporting-commit rows explicitly before the parent.
+        let tx = self.begin_immediate_transaction().await?;
+        tx.execute(
+            "DELETE FROM fetch_supporting_commits WHERE fetch_id = ?",
+            libsql::params![id],
+        )
+        .await?;
+        tx.execute("DELETE FROM fetch_queue WHERE id = ?", libsql::params![id])
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Release a fetch back to Pending with a future retry time and record the
+    /// last error. Used for transient failures within the retry window.
+    pub async fn set_fetch_retry_at(&self, id: i64, next_retry_at: i64, error: &str) -> Result<()> {
+        self.execute(
+            "UPDATE fetch_queue \
+             SET status = 'Pending', next_retry_at = ?, last_error = ?, \
+                 locked_at = NULL WHERE id = ?",
+            libsql::params![next_retry_at, error, id],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Terminally fail a fetch after its retry window is exhausted.
+    pub async fn mark_fetch_failed(&self, id: i64, error: &str) -> Result<()> {
+        self.execute(
+            "UPDATE fetch_queue SET status = 'Failed', last_error = ?, \
+             locked_at = NULL WHERE id = ?",
+            libsql::params![error, id],
+        )
+        .await?;
+        Ok(())
+    }
+
     fn row_to_fetch_queue(row: &libsql::Row) -> Result<FetchQueueRow> {
         Ok(FetchQueueRow {
             id: row.get(0)?,
