@@ -9772,6 +9772,64 @@ impl Database {
         self.rerun_patchset(patchset_id).await
     }
 
+    // --- Durable fetch queue -------------------------------------------------
+    //
+    // These operations back the FetchWorker. They mirror the patchwork_outbox
+    // pattern: work is claimed under a lease (locked_at), retried with backoff
+    // (next_retry_at), completed, terminally failed, or reclaimed by a ghost
+    // sweep when a worker dies mid-flight.
+
+    /// Enqueue a git fetch. Idempotent: an active (Pending/Fetching) row for the
+    /// same commit and repo is left untouched so duplicate submissions collapse.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn enqueue_fetch(
+        &self,
+        patchset_id: Option<i64>,
+        cover_letter_message_id: Option<&str>,
+        repo_url: Option<&str>,
+        commit_hash: &str,
+        mr_url: Option<&str>,
+        mr_title: Option<&str>,
+        mr_number: Option<i64>,
+        priority: i32,
+    ) -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+
+        self.conn
+            .execute(
+                "INSERT INTO fetch_queue ( \
+                     patchset_id, cover_letter_message_id, repo_url, commit_hash, \
+                     mr_url, mr_title, mr_number, status, attempts, priority, created_at \
+                 ) \
+                 SELECT ?, ?, ?, ?, ?, ?, ?, 'Pending', 0, ?, ? \
+                 WHERE NOT EXISTS ( \
+                     SELECT 1 FROM fetch_queue \
+                     WHERE commit_hash = ? \
+                       AND IFNULL(repo_url, '') = IFNULL(?, '') \
+                       AND IFNULL(cover_letter_message_id, '') = IFNULL(?, '') \
+                       AND status IN ('Pending', 'Fetching') \
+                 )",
+                libsql::params![
+                    patchset_id,
+                    cover_letter_message_id,
+                    repo_url,
+                    commit_hash,
+                    mr_url,
+                    mr_title,
+                    mr_number,
+                    priority,
+                    now,
+                    commit_hash,
+                    repo_url,
+                    cover_letter_message_id,
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn has_patchset_by_msgid(&self, msgid: &str) -> Result<bool> {
         let candidates = Self::get_msgid_candidates(msgid);
         for clid in &candidates {
