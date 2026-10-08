@@ -1007,45 +1007,22 @@ impl FetchWorker {
         }
     }
 
-    async fn fetch_all(&self, remote: &str) -> Result<()> {
-        let output = self.fetch_with_graph_retry(&[remote]).await?;
-
-        if !output.status.success() {
-            return Err(anyhow!(
-                "Fetch all failed: {}",
-                redact_secret(String::from_utf8_lossy(&output.stderr).trim())
-            ));
-        }
-        Ok(())
-    }
-
-    async fn is_present(&self, commit_or_range: &str) -> bool {
-        let commit_or_range = commit_or_range.trim();
-        if commit_or_range.starts_with('-') {
+    async fn is_present(&self, commit: &str) -> bool {
+        let commit = commit.trim();
+        if commit.starts_with('-') {
             return false;
         }
-        let mut args = vec!["-c", "safe.bareRepository=all"];
-        let arg_str: String;
-
-        if let Some((start, end)) = commit_or_range.split_once("..") {
-            if start.trim().starts_with('-') || end.trim().starts_with('-') {
-                return false;
-            }
-            arg_str = format!("{}^{{commit}}..{}^{{commit}}", start.trim(), end.trim());
-            args.extend(["rev-list", "-n", "1", "--end-of-options", &arg_str]);
-        } else {
-            arg_str = format!("{}^{{commit}}", commit_or_range);
-            args.extend([
+        let arg_str = format!("{}^{{commit}}", commit);
+        let output = crate::git_cmd::in_dir_async(&self.repo_path)
+            .args([
+                "-c",
+                "safe.bareRepository=all",
                 "rev-parse",
                 "--verify",
                 "--quiet",
                 "--end-of-options",
                 &arg_str,
-            ]);
-        };
-
-        let output = crate::git_cmd::in_dir_async(&self.repo_path)
-            .args(&args)
+            ])
             .output()
             .await;
 
@@ -1053,18 +1030,18 @@ impl FetchWorker {
             Ok(s) => {
                 let success = s.status.success();
                 if success {
-                    info!("is_present: {} is present", commit_or_range);
+                    info!("is_present: {} is present", commit);
                 } else {
                     info!(
                         "is_present: {} is missing or not a commit. stderr: {}",
-                        commit_or_range,
+                        commit,
                         String::from_utf8_lossy(&s.stderr)
                     );
                 }
                 success
             }
             Err(e) => {
-                error!("is_present: {} check failed: {}", commit_or_range, e);
+                error!("is_present: {} check failed: {}", commit, e);
                 false
             }
         }
