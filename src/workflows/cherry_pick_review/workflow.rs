@@ -28,12 +28,12 @@ use serde_json::{Value, json};
 use crate::ai::AiProvider;
 use crate::toolbox::ToolBox;
 use crate::worker::prompts::PromptRegistry;
-use crate::workflow::{PromptTemplate, RecitationPolicy};
+use crate::workflow::{OutputFormat, PromptTemplate, RecitationPolicy, Stage, ToolScope};
 use crate::workflows::linux_patch_review;
 
 use super::prompts::{
-    DROPPED_CHANGES, MERGE_CONFLICT_REVIEW_FRAMING, MERGE_CORRECTNESS, PREFETCHED_CONTEXT_HEADER,
-    SEMANTIC_INTENT,
+    ANALYSIS_FORMAT_GUIDANCE, DROPPED_CHANGES, MERGE_CONFLICT_REVIEW_FRAMING, MERGE_CORRECTNESS,
+    PREFETCHED_CONTEXT_HEADER, SEMANTIC_INTENT,
 };
 
 /// A cherry-pick / merge-conflict resolution review workflow.
@@ -502,6 +502,59 @@ fn analysis_stage_spec(num: u8) -> (&'static str, &'static str, &'static [&'stat
         _ => unreachable!("invalid analysis stage number: {}", num),
     };
     (name, instruction, guides, use_log)
+}
+
+#[allow(dead_code)]
+fn build_analysis_stage(
+    num: u8,
+    max_turns: usize,
+    temperature: f32,
+) -> Stage<CherryPickState, Value> {
+    let (name, instruction, guides, use_log) = analysis_stage_spec(num);
+
+    let mut template_text = format!("{instruction}\n\n{ANALYSIS_FORMAT_GUIDANCE}");
+    if !guides.is_empty() {
+        template_text.push_str("\n\n<expert_analysis_guidelines>\n");
+        for guide in guides {
+            template_text.push_str(&format!("@include(\"{guide}\")\n"));
+        }
+        template_text.push_str("</expert_analysis_guidelines>\n");
+    }
+    let mut user_prompt = PromptTemplate::new(template_text);
+    for guide in guides {
+        user_prompt = user_prompt.include_file(*guide);
+    }
+
+    Stage::builder(name)
+        .system_prompt(cherry_pick_system_prompt(use_log))
+        .user_prompt(user_prompt)
+        .output_format(
+            OutputFormat::json()
+                .with_validator(validate_stages_1_to_7)
+                .with_feedback_formatter(format_stage1_to_7_feedback),
+        )
+        .tools(ToolScope::All)
+        .max_turns(max_turns)
+        .temperature(temperature)
+        .on_recitation(recitation_reminder())
+        .reduce(move |state: &mut CherryPickState, val: Value| {
+            if let Some(arr) = val.get("concerns").and_then(|v| v.as_array()) {
+                for item in arr {
+                    if let Some(tagged) = tag_source(item.clone(), num) {
+                        state.total_concerns += 1;
+                        state.concerns.push(tagged);
+                    }
+                }
+            }
+            if let Some(arr) = val.get("dismissed_concerns").and_then(|v| v.as_array()) {
+                for item in arr {
+                    if let Some(tagged) = tag_source(item.clone(), num) {
+                        state.dismissed_concerns.push(tagged);
+                    }
+                }
+            }
+        })
+        .build()
 }
 
 #[allow(dead_code)]
