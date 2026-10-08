@@ -9996,6 +9996,46 @@ impl Database {
         Ok(())
     }
 
+    /// Reclaim fetches whose lease has expired because their worker died
+    /// mid-flight. Returns the number of rows reset to Pending.
+    pub async fn sweep_ghost_fetches(&self, lease_secs: i64) -> Result<u64> {
+        let cutoff = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64)
+            - lease_secs;
+        let count = self
+            .conn
+            .execute(
+                "UPDATE fetch_queue SET status = 'Pending', locked_at = NULL \
+                 WHERE id IN ( \
+                     SELECT id FROM fetch_queue \
+                     WHERE status = 'Fetching' AND locked_at IS NOT NULL \
+                       AND locked_at < ? LIMIT 100 \
+                 )",
+                libsql::params![cutoff],
+            )
+            .await?;
+        Ok(count)
+    }
+
+    /// Renew the lease on an in-flight fetch so long-running operations do not
+    /// get reclaimed by the ghost sweep. Returns true if the lease was
+    /// successfully renewed, or false if the lease was lost or already finished.
+    pub async fn renew_fetch_lease(&self, id: i64, expected_attempts: i64) -> Result<bool> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+        let count = self
+            .conn
+            .execute(
+                "UPDATE fetch_queue SET locked_at = ? \
+                 WHERE id = ? AND status = 'Fetching' AND attempts = ?",
+                libsql::params![now, id, expected_attempts],
+            )
+            .await?;
+        Ok(count > 0)
+    }
+
     fn row_to_fetch_queue(row: &libsql::Row) -> Result<FetchQueueRow> {
         Ok(FetchQueueRow {
             id: row.get(0)?,
