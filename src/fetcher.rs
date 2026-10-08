@@ -42,6 +42,10 @@ const BACKOFF_CAP_SECS: i64 = 600;
 /// `git fetch` call. Batching improves server-side pack negotiation.
 const BATCH_SIZE: usize = 20;
 
+/// Maximum number of commits allowed in a single range ingestion to prevent
+/// unbounded processing and resource exhaustion from untrusted inputs.
+const MAX_RANGE_COMMITS: usize = 256;
+
 /// Marker error for failures that can never succeed on retry (e.g. a commit
 /// is missing and the row has no remote to fetch from). These bypass the
 /// backoff retry window and fail the fetch immediately, mirroring the
@@ -465,11 +469,25 @@ impl FetchWorker {
         let mr_title = row.mr_title.clone();
 
         if row.commit_hash.contains("..") {
-            let shas = crate::git_ops::resolve_git_range(&self.repo_path, &row.commit_hash).await?;
+            let shas = crate::git_ops::resolve_git_range_bounded(
+                &self.repo_path,
+                &row.commit_hash,
+                Some(MAX_RANGE_COMMITS + 1),
+            )
+            .await?;
             if shas.is_empty() {
                 return Err(PermanentFetchError(format!(
                     "Commit range {} resolved to zero commits",
                     row.commit_hash
+                ))
+                .into());
+            }
+            if shas.len() > MAX_RANGE_COMMITS {
+                return Err(PermanentFetchError(format!(
+                    "git range '{}' contains {} commits, exceeding maximum of {}",
+                    row.commit_hash,
+                    shas.len(),
+                    MAX_RANGE_COMMITS
                 ))
                 .into());
             }
@@ -1701,6 +1719,84 @@ mod tests {
             ..row
         };
         assert!(worker.ensure_present(&row_valid).await.is_ok());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_oversized_git_range_rejected() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let repo_path = temp_dir.path().to_path_buf();
+
+        crate::git_cmd::in_dir_async(&repo_path)
+            .arg("init")
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(&repo_path)
+            .args(["config", "user.name", "Test User"])
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(&repo_path)
+            .args(["config", "user.email", "test@example.com"])
+            .output()
+            .await?;
+
+        let tree_out = crate::git_cmd::in_dir_async(&repo_path)
+            .arg("write-tree")
+            .output()
+            .await?;
+        let tree = String::from_utf8(tree_out.stdout)?.trim().to_string();
+
+        let base_out = crate::git_cmd::in_dir_async(&repo_path)
+            .args(["commit-tree", &tree, "-m", "base"])
+            .output()
+            .await?;
+        let base_sha = String::from_utf8(base_out.stdout)?.trim().to_string();
+
+        let mut parent = base_sha.clone();
+        for i in 0..=MAX_RANGE_COMMITS {
+            let out = crate::git_cmd::in_dir_async(&repo_path)
+                .args([
+                    "commit-tree",
+                    &tree,
+                    "-p",
+                    &parent,
+                    "-m",
+                    &format!("c{}", i),
+                ])
+                .output()
+                .await?;
+            parent = String::from_utf8(out.stdout)?.trim().to_string();
+        }
+
+        let worker = test_worker(repo_path).await;
+        let row = FetchQueueRow {
+            id: 1,
+            patchset_id: None,
+            cover_letter_message_id: None,
+            repo_url: None,
+            commit_hash: format!("{}..{}", base_sha, parent),
+            mr_url: None,
+            mr_title: None,
+            mr_number: None,
+            status: crate::db::FetchStatus::Pending,
+            attempts: 0,
+            first_attempt_at: None,
+            next_retry_at: None,
+            locked_at: None,
+            last_error: None,
+            priority: 500,
+            created_at: 0,
+            supporting_commits: Vec::new(),
+        };
+
+        let err = worker.ingest(&row).await.unwrap_err();
+        assert!(
+            err.downcast_ref::<PermanentFetchError>().is_some(),
+            "expected PermanentFetchError, got: {:?}",
+            err
+        );
+        assert!(err.to_string().contains("exceeding maximum of 256"));
 
         Ok(())
     }

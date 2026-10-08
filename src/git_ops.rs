@@ -1494,11 +1494,20 @@ pub struct PatchMetadata {
 
 /// Resolve a git range (e.g. "HEAD~3..HEAD") to an ordered list of commit SHAs.
 pub async fn resolve_git_range(repo_path: &Path, range: &str) -> Result<Vec<String>> {
-    let output = crate::git_cmd::in_dir_async(repo_path)
-        .args(["-c", "safe.bareRepository=all"])
-        .args(["rev-list", "--reverse", range])
-        .output()
-        .await?;
+    resolve_git_range_bounded(repo_path, range, None).await
+}
+
+pub async fn resolve_git_range_bounded(
+    repo_path: &Path,
+    range: &str,
+    max_count: Option<usize>,
+) -> Result<Vec<String>> {
+    let mut cmd = crate::git_cmd::in_dir_async(repo_path);
+    cmd.args(["-c", "safe.bareRepository=all", "rev-list", "--reverse"]);
+    if let Some(max) = max_count {
+        cmd.arg(format!("--max-count={}", max));
+    }
+    let output = cmd.arg(range).output().await?;
 
     if !output.status.success() {
         return Err(anyhow!(
