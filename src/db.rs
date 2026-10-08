@@ -9747,6 +9747,7 @@ impl Database {
         mr_title: Option<&str>,
         mr_number: Option<i64>,
         slug: Option<&str>,
+        repo_url: Option<&str>,
         priority: Option<i32>,
     ) -> Result<i64> {
         let now = std::time::SystemTime::now()
@@ -9803,13 +9804,13 @@ impl Database {
                     }
                     if let Some(prio) = priority {
                         self.execute(
-                            "UPDATE patchsets SET status = 'Fetching', failed_reason = NULL, subject = ?, skip_filters = ?, only_filters = ?, mr_url = ?, mr_title = ?, mr_number = ?, slug = ?, base_priority = COALESCE(MAX(base_priority, ?), ?), priority = CASE WHEN priority_cap IS NOT NULL THEN MIN(priority_cap, COALESCE(MAX(base_priority, ?), ?)) ELSE COALESCE(MAX(base_priority, ?), ?) END WHERE id = ?",
-                            libsql::params![effective_subject, skip_filters_json.clone(), only_filters_json.clone(), mr_url, mr_title, mr_number, slug, prio, prio, prio, prio, prio, prio, id]
+                            "UPDATE patchsets SET status = 'Fetching', failed_reason = NULL, subject = ?, skip_filters = ?, only_filters = ?, mr_url = ?, mr_title = ?, mr_number = ?, slug = ?, repo_url = ?, base_priority = COALESCE(MAX(base_priority, ?), ?), priority = CASE WHEN priority_cap IS NOT NULL THEN MIN(priority_cap, COALESCE(MAX(base_priority, ?), ?)) ELSE COALESCE(MAX(base_priority, ?), ?) END WHERE id = ?",
+                            libsql::params![effective_subject, skip_filters_json.clone(), only_filters_json.clone(), mr_url, mr_title, mr_number, slug, repo_url, prio, prio, prio, prio, prio, prio, id]
                         ).await?;
                     } else {
                         self.execute(
-                            "UPDATE patchsets SET status = 'Fetching', failed_reason = NULL, subject = ?, skip_filters = ?, only_filters = ?, mr_url = ?, mr_title = ?, mr_number = ?, slug = ? WHERE id = ?",
-                            libsql::params![effective_subject, skip_filters_json.clone(), only_filters_json.clone(), mr_url, mr_title, mr_number, slug, id]
+                            "UPDATE patchsets SET status = 'Fetching', failed_reason = NULL, subject = ?, skip_filters = ?, only_filters = ?, mr_url = ?, mr_title = ?, mr_number = ?, slug = ?, repo_url = ? WHERE id = ?",
+                            libsql::params![effective_subject, skip_filters_json.clone(), only_filters_json.clone(), mr_url, mr_title, mr_number, slug, repo_url, id]
                         ).await?;
                     }
                 }
@@ -9830,12 +9831,12 @@ impl Database {
         let eff_priority = priority.unwrap_or(crate::settings::DEFAULT_PRIORITY);
         let id = self
             .query_returning_i64(
-                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, status, date, skip_filters, only_filters, mr_url, mr_title, mr_number, slug, base_priority, priority)
-                     VALUES (?, ?, ?, 'Fetching', ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-                libsql::params![thread_id, root_msg_id, effective_subject, now, skip_filters_json, only_filters_json, mr_url, mr_title, mr_number, slug, priority, eff_priority],
+                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, status, date, skip_filters, only_filters, mr_url, mr_title, mr_number, slug, repo_url, base_priority, priority)
+                     VALUES (?, ?, ?, 'Fetching', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                libsql::params![thread_id, root_msg_id, effective_subject, now, skip_filters_json, only_filters_json, mr_url, mr_title, mr_number, slug, repo_url, priority, eff_priority],
             )
             .await?
-            .ok_or_else(|| anyhow::anyhow!("Failed to get patchset ID"))?;
+            .ok_or_else(|| anyhow::anyhow!("Failed to insert patchset"))?;
         self.reconcile_superseded_pr_patchsets(id, mr_url, mr_number)
             .await?;
         Ok(id)
@@ -12820,6 +12821,7 @@ mod tests {
                 Some("Test priority cap"),
                 Some(100),
                 Some("sashiko-100"),
+                None,
                 Some(500),
             )
             .await
@@ -12862,6 +12864,7 @@ mod tests {
                 Some("Test priority cap retry"),
                 Some(100),
                 Some("sashiko-100"),
+                None,
                 Some(800),
             )
             .await
@@ -12904,6 +12907,7 @@ mod tests {
             Some("Test lower priority retry"),
             Some(100),
             Some("sashiko-100"),
+            None,
             Some(700),
         )
         .await
@@ -17086,6 +17090,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -17857,6 +17862,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -17956,6 +17962,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -17976,6 +17983,7 @@ mod tests {
             .create_fetching_patchset(
                 &synthetic_cancelled,
                 "Fetching cancelled placeholder",
+                None,
                 None,
                 None,
                 None,
@@ -18232,6 +18240,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -18299,6 +18308,7 @@ mod tests {
             .create_fetching_patchset(
                 &synthetic_cover,
                 "Fetching retry",
+                None,
                 None,
                 None,
                 None,
@@ -21114,6 +21124,7 @@ mod tests {
                 Some(501),
                 Some(slug),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -21249,6 +21260,7 @@ mod tests {
                 Some(mr_number),
                 Some(slug),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -21281,6 +21293,7 @@ mod tests {
                 Some(mr_number),
                 Some(slug),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -21304,6 +21317,7 @@ mod tests {
                 Some(title),
                 Some(mr_number),
                 Some(slug),
+                None,
                 None,
             )
             .await
@@ -21353,6 +21367,7 @@ mod tests {
                 Some("Sashiko fixups"),
                 Some(515),
                 Some("sashiko-515"),
+                None,
                 None,
             )
             .await
@@ -21441,6 +21456,7 @@ mod tests {
                 Some(515),
                 Some("sashiko-515"),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -21457,6 +21473,7 @@ mod tests {
                 Some(515),
                 Some("sashiko-515"),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -21472,6 +21489,7 @@ mod tests {
                 Some("Improve review cancellation"),
                 Some(515),
                 Some("sashiko-515"),
+                None,
                 None,
             )
             .await
@@ -21510,6 +21528,7 @@ mod tests {
                 Some(515),
                 Some("sashiko-515"),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -21533,6 +21552,7 @@ mod tests {
                 Some("Improve review cancellation"),
                 Some(515),
                 Some("sashiko-515"),
+                None,
                 None,
             )
             .await
@@ -21858,6 +21878,7 @@ mod tests {
                 Some("Test claim guard"),
                 Some(600),
                 Some("sashiko-600"),
+                None,
                 None,
             )
             .await
@@ -23275,6 +23296,7 @@ mod tests {
                         None,
                         None,
                         None,
+                        None,
                     )
                     .await
                     .expect("create_fetching_patchset failed under concurrency");
@@ -23368,12 +23390,14 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
         db.create_fetching_patchset(
             "msg-fetching-2",
             "(placeholder)",
+            None,
             None,
             None,
             None,
