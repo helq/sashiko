@@ -20,6 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::{Output, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, interval};
 use tracing::{error, info, warn};
@@ -183,28 +184,42 @@ impl FetchWorker {
     pub async fn run(self) {
         info!("FetchWorker started");
 
+        // Reclaim ghost leases on an independent task so that a long-running (or
+        // stuck) fetch on the main loop can never prevent dead-worker recovery.
+        let mut sweeper = Self::spawn_sweeper(Arc::clone(&self.db));
+
         loop {
+            if sweeper.0.is_finished() {
+                if let Err(e) = (&mut sweeper.0).await {
+                    error!(
+                        "Ghost fetch sweeper task terminated unexpectedly: {}; respawning",
+                        e
+                    );
+                }
+                sweeper = Self::spawn_sweeper(Arc::clone(&self.db));
+            }
+
             // Claim up to BATCH_SIZE rows and pre-fetch their objects in a
             // single `git fetch` call. Batching lets the server compute one
             // optimal pack for many wants, avoiding the pathological 11M-object
             // downloads that happen when unreachable SHAs are fetched one at a
-            // time with poor negotiation.
-            let mut batch = Vec::new();
-            loop {
-                if batch.len() >= BATCH_SIZE {
-                    break;
-                }
-                match self.db.lock_pending_fetch().await {
-                    Ok(Some(row)) => batch.push(row),
-                    Ok(None) => break,
-                    Err(e) => {
-                        error!("Failed to claim pending fetch: {}", e);
-                        break;
+            // time with poor negotiation. Retrying rows (attempts > 1 after
+            // claim) are isolated into single-row batches so a slow or failing
+            // retry cannot delay fresh rows in the same batch.
+            let batch = self.claim_batch().await;
+            if batch.is_empty() {
+                tokio::select! {
+                    _ = tokio::time::sleep(POLL_INTERVAL) => {}
+                    res = &mut sweeper.0 => {
+                        if let Err(e) = res {
+                            error!(
+                                "Ghost fetch sweeper task terminated unexpectedly: {}; respawning",
+                                e
+                            );
+                        }
+                        sweeper = Self::spawn_sweeper(Arc::clone(&self.db));
                     }
                 }
-            }
-            if batch.is_empty() {
-                tokio::time::sleep(POLL_INTERVAL).await;
                 continue;
             }
 
@@ -216,13 +231,58 @@ impl FetchWorker {
                 }
             }
 
+            // Spawn a periodic heartbeat task (every 60s) to keep leases alive
+            // across both prefetch and batch processing. The TaskAbortGuard ensures
+            // the task is always aborted when the batch scope ends (or on panic/early return).
+            // active_idx tracks the index of the row currently being processed so
+            // completed rows are retired before their DB state is cleared and never
+            // emit false-positive lease-lost warnings.
+            let db = Arc::clone(&self.db);
+            let active_idx = Arc::new(AtomicUsize::new(0));
+            let heartbeat_active_idx = Arc::clone(&active_idx);
+            let mut leases: Vec<(usize, i64, i64)> = batch
+                .iter()
+                .enumerate()
+                .map(|(idx, r)| (idx, r.id, r.attempts))
+                .collect();
+            let _heartbeat = TaskAbortGuard(tokio::spawn(async move {
+                let mut ticker = interval(Duration::from_secs(60));
+                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
+                    let mut still_held = Vec::with_capacity(leases.len());
+                    for (idx, id, attempts) in leases {
+                        if idx < heartbeat_active_idx.load(Ordering::Acquire) {
+                            continue;
+                        }
+                        match db.renew_fetch_lease(id, attempts).await {
+                            Ok(true) => still_held.push((idx, id, attempts)),
+                            Ok(false) => {
+                                if idx >= heartbeat_active_idx.load(Ordering::Acquire) {
+                                    warn!("Fetch lease lost during heartbeat for row {}", id);
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to renew fetch lease for row {}: {}", id, e);
+                                still_held.push((idx, id, attempts));
+                            }
+                        }
+                    }
+                    leases = still_held;
+                    if leases.is_empty() {
+                        break;
+                    }
+                }
+            }));
+
             // Pre-fetch all missing objects in one batch call.
             self.batch_prefetch(&batch).await;
 
             // Process each row individually for ingestion.
-            for row in batch {
+            for (idx, row) in batch.into_iter().enumerate() {
                 match self.db.renew_fetch_lease(row.id, row.attempts).await {
                     Ok(false) => {
+                        active_idx.store(idx + 1, Ordering::Release);
                         warn!(
                             "Fetch lease for {} expired/lost to sweeper; skipping",
                             row.id
@@ -230,14 +290,62 @@ impl FetchWorker {
                         continue;
                     }
                     Err(e) => {
+                        active_idx.store(idx + 1, Ordering::Release);
                         error!("Database error renewing fetch lease for {}: {}", row.id, e);
                         continue;
                     }
                     Ok(true) => {}
                 }
-                self.process_row(row).await;
+                self.process_row(row, &active_idx, idx + 1).await;
             }
         }
+    }
+
+    /// Claim up to `BATCH_SIZE` due rows from the queue.
+    ///
+    /// Fresh rows (`attempts == 1` after claim) may be batched together up to
+    /// `BATCH_SIZE`, whereas retrying rows (`attempts > 1` after claim) are
+    /// isolated into single-row batches and never appended to a fresh batch.
+    async fn claim_batch(&self) -> Vec<FetchQueueRow> {
+        let mut batch = Vec::new();
+        while batch.len() < BATCH_SIZE {
+            let max_prev_attempts = if batch.is_empty() { None } else { Some(0) };
+            match self
+                .db
+                .lock_pending_fetch_with_max_attempts(max_prev_attempts)
+                .await
+            {
+                Ok(Some(row)) => {
+                    let is_retry = row.attempts > 1;
+                    batch.push(row);
+                    if is_retry {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    error!("Failed to claim pending fetch: {}", e);
+                    break;
+                }
+            }
+        }
+        batch
+    }
+
+    fn spawn_sweeper(db: Arc<Database>) -> TaskAbortGuard {
+        TaskAbortGuard(tokio::spawn(async move {
+            let mut sweep = interval(SWEEP_INTERVAL);
+            loop {
+                sweep.tick().await;
+                match db.sweep_ghost_fetches(GHOST_LEASE_SECS).await {
+                    Ok(n) if n > 0 => {
+                        warn!("Reclaimed {} ghost fetch(es) from dead workers", n);
+                    }
+                    Ok(_) => {}
+                    Err(e) => error!("Ghost fetch sweep failed: {}", e),
+                }
+            }
+        }))
     }
 
     /// Decide whether to retry (with backoff) or terminally fail a fetch.
@@ -310,18 +418,22 @@ impl FetchWorker {
     /// corresponding events. On any failure the row is retried with backoff, or
     /// failed terminally once the retry window is exhausted.
     #[allow(dead_code)]
-    async fn process_row(&self, row: FetchQueueRow) {
+    async fn process_row(&self, row: FetchQueueRow, active_idx: &AtomicUsize, next_idx: usize) {
         info!(
             "Processing fetch {} (commit {}, attempt {})",
             row.id, row.commit_hash, row.attempts
         );
 
         if let Err(e) = self.ensure_present(&row).await {
+            active_idx.store(next_idx, Ordering::Release);
             self.handle_failure(&row, e.context("fetch failed")).await;
             return;
         }
 
-        match self.ingest(&row).await {
+        let ingest_res = self.ingest(&row).await;
+        active_idx.store(next_idx, Ordering::Release);
+
+        match ingest_res {
             Ok(()) => {
                 if let Err(e) = self.db.mark_fetch_done(row.id).await {
                     error!("Failed to mark fetch {} done: {}", row.id, e);
@@ -1363,6 +1475,238 @@ mod tests {
             .await?;
         assert!(!out_blocked.status.success());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_process_row_advances_active_idx_before_completion() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let repo_path = temp_dir.path().to_path_buf();
+        crate::git_cmd::in_dir_async(&repo_path)
+            .args(["init", "-b", "main"])
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(&repo_path)
+            .args(["config", "user.name", "Test"])
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(&repo_path)
+            .args(["config", "user.email", "test@test.com"])
+            .output()
+            .await?;
+        std::fs::write(repo_path.join("file.txt"), "hello\n")?;
+        crate::git_cmd::in_dir_async(&repo_path)
+            .args(["add", "."])
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(&repo_path)
+            .args(["commit", "-m", "init"])
+            .output()
+            .await?;
+
+        let head = String::from_utf8(
+            crate::git_cmd::in_dir_async(&repo_path)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .await?
+                .stdout,
+        )?
+        .trim()
+        .to_string();
+
+        let settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Arc::new(Database::new(&settings).await?);
+        db.migrate().await?;
+        let (tx, _rx) = mpsc::channel(10);
+        let worker = FetchWorker::new(repo_path, Arc::clone(&db), tx, None);
+
+        db.enqueue_fetch(None, Some("cover-ok"), None, &head, None, None, None, 500)
+            .await?;
+        db.enqueue_fetch(
+            None,
+            Some("cover-err"),
+            None,
+            "--invalid-ref",
+            None,
+            None,
+            None,
+            500,
+        )
+        .await?;
+
+        let row0 = db.lock_pending_fetch().await?.unwrap();
+        let row1 = db.lock_pending_fetch().await?.unwrap();
+        let row0_id = row0.id;
+        let row0_attempts = row0.attempts;
+        let row1_id = row1.id;
+        let row1_attempts = row1.attempts;
+
+        let active_idx = AtomicUsize::new(0);
+
+        worker.process_row(row0, &active_idx, 1).await;
+        assert_eq!(active_idx.load(Ordering::Acquire), 1);
+        assert!(!db.renew_fetch_lease(row0_id, row0_attempts).await?);
+        assert!(db.renew_fetch_lease(row1_id, row1_attempts).await?);
+
+        worker.process_row(row1, &active_idx, 2).await;
+        assert_eq!(active_idx.load(Ordering::Acquire), 2);
+        assert!(!db.renew_fetch_lease(row1_id, row1_attempts).await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_batch_prefetch_skips_single_row_remote() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let remote_path = temp_dir.path().join("remote");
+        let local_path = temp_dir.path().join("local");
+        std::fs::create_dir_all(&remote_path)?;
+        std::fs::create_dir_all(&local_path)?;
+
+        crate::git_cmd::in_dir_async(&remote_path)
+            .args(["init", "-b", "main"])
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(&remote_path)
+            .args(["config", "user.name", "Test User"])
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(&remote_path)
+            .args(["config", "user.email", "test@example.com"])
+            .output()
+            .await?;
+
+        std::fs::write(remote_path.join("file.txt"), "c1\n")?;
+        crate::git_cmd::in_dir_async(&remote_path)
+            .args(["add", "."])
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(&remote_path)
+            .args(["commit", "-m", "commit 1"])
+            .output()
+            .await?;
+        let sha1 = String::from_utf8(
+            crate::git_cmd::in_dir_async(&remote_path)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .await?
+                .stdout,
+        )?
+        .trim()
+        .to_string();
+
+        std::fs::write(remote_path.join("file.txt"), "c2\n")?;
+        crate::git_cmd::in_dir_async(&remote_path)
+            .args(["add", "."])
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(&remote_path)
+            .args(["commit", "-m", "commit 2"])
+            .output()
+            .await?;
+        let sha2 = String::from_utf8(
+            crate::git_cmd::in_dir_async(&remote_path)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .await?
+                .stdout,
+        )?
+        .trim()
+        .to_string();
+
+        crate::git_cmd::in_dir_async(&local_path)
+            .args(["init", "-b", "main"])
+            .output()
+            .await?;
+        let worker = test_worker(local_path).await;
+        let remote_url = remote_path.to_str().unwrap().to_string();
+
+        let row1 = FetchQueueRow {
+            id: 1,
+            patchset_id: None,
+            cover_letter_message_id: None,
+            repo_url: Some(remote_url.clone()),
+            commit_hash: sha1.clone(),
+            mr_url: None,
+            mr_title: None,
+            mr_number: None,
+            status: crate::db::FetchStatus::Fetching,
+            attempts: 1,
+            first_attempt_at: None,
+            next_retry_at: None,
+            locked_at: None,
+            last_error: None,
+            priority: 500,
+            created_at: 0,
+            supporting_commits: Vec::new(),
+        };
+        let row2 = FetchQueueRow {
+            id: 2,
+            commit_hash: sha2.clone(),
+            ..row1.clone()
+        };
+
+        // A single row for a remote must not trigger batch_prefetch (avoiding
+        // duplicate fetches when ensure_present runs next).
+        worker.batch_prefetch(std::slice::from_ref(&row1)).await;
+        assert!(!worker.is_present(&sha1).await);
+
+        // Two rows needing the same remote trigger batch_prefetch in one call.
+        worker.batch_prefetch(&[row1, row2]).await;
+        assert!(worker.is_present(&sha1).await);
+        assert!(worker.is_present(&sha2).await);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_claim_batch_isolates_retries_from_fresh_rows() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let worker = test_worker(temp_dir.path().to_path_buf()).await;
+
+        // Enqueue two rows that fail once and become due retries (attempts = 1).
+        worker
+            .db
+            .enqueue_fetch(None, None, Some("repo"), "retry-1", None, None, None, 600)
+            .await?;
+        worker
+            .db
+            .enqueue_fetch(None, None, Some("repo"), "retry-2", None, None, None, 600)
+            .await?;
+        let r1 = worker.db.lock_pending_fetch().await?.unwrap();
+        let r2 = worker.db.lock_pending_fetch().await?.unwrap();
+        worker.db.set_fetch_retry_at(r1.id, 1, "transient").await?;
+        worker.db.set_fetch_retry_at(r2.id, 1, "transient").await?;
+
+        // Enqueue two fresh rows (attempts = 0).
+        worker
+            .db
+            .enqueue_fetch(None, None, Some("repo"), "fresh-1", None, None, None, 500)
+            .await?;
+        worker
+            .db
+            .enqueue_fetch(None, None, Some("repo"), "fresh-2", None, None, None, 500)
+            .await?;
+
+        // First batch must contain ONLY the two fresh rows, leaving the due
+        // retries unclaimed rather than mixing them into the fresh batch.
+        let batch1 = worker.claim_batch().await;
+        let hashes1: Vec<&str> = batch1.iter().map(|r| r.commit_hash.as_str()).collect();
+        assert_eq!(hashes1, vec!["fresh-1", "fresh-2"]);
+
+        // Subsequent batches claim the due retry rows one at a time (batch size 1).
+        let batch2 = worker.claim_batch().await;
+        let hashes2: Vec<&str> = batch2.iter().map(|r| r.commit_hash.as_str()).collect();
+        assert_eq!(hashes2, vec!["retry-1"]);
+
+        let batch3 = worker.claim_batch().await;
+        let hashes3: Vec<&str> = batch3.iter().map(|r| r.commit_hash.as_str()).collect();
+        assert_eq!(hashes3, vec!["retry-2"]);
+
+        assert!(worker.claim_batch().await.is_empty());
         Ok(())
     }
 
