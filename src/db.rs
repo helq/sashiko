@@ -2079,7 +2079,29 @@ impl Database {
             }
         }
 
-        info!("Database schema is up to date at version 14.");
+        if current_version < 15 {
+            info!("Applying database migration version 15 (fetch queue)...");
+            let has_repo_url = {
+                let mut columns = self.conn.query("PRAGMA table_info(patchsets)", ()).await?;
+                let mut found = false;
+                while let Some(row) = columns.next().await? {
+                    let name: String = row.get(1)?;
+                    found |= name == "repo_url";
+                }
+                found
+            };
+            if !has_repo_url {
+                let tx = self.begin_transaction().await?;
+                tx.execute_batch(include_str!("migrations/014_fetch_queue.sql"))
+                    .await?;
+                tx.execute("PRAGMA user_version = 15", ()).await?;
+                tx.commit().await?;
+            } else {
+                self.execute("PRAGMA user_version = 15", ()).await?;
+            }
+        }
+
+        info!("Database schema is up to date at version 15.");
 
         Ok(())
     }
@@ -12966,7 +12988,7 @@ mod tests {
 
         let mut v_rows = db.conn.query("PRAGMA user_version", ()).await.unwrap();
         let version: i64 = v_rows.next().await.unwrap().unwrap().get(0).unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
 
         // Must now be able to query and insert priority-aware patchsets without column errors
         let thread_id = db.create_thread("root", "Test Thread", 1000).await.unwrap();
@@ -18890,7 +18912,7 @@ mod tests {
 
         let mut v_rows = db.conn.query("PRAGMA user_version", ()).await.unwrap();
         let version: i64 = v_rows.next().await.unwrap().unwrap().get(0).unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
 
         let mut rows = db
             .conn
