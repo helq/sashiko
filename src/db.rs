@@ -12518,6 +12518,474 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_fetch_queue_claim_is_exclusive_and_ordered() {
+        let db = setup_db().await;
+        db.enqueue_fetch(
+            None,
+            Some("a@x"),
+            Some("repo"),
+            "sha_low",
+            None,
+            None,
+            None,
+            100,
+        )
+        .await
+        .unwrap();
+        db.enqueue_fetch(
+            None,
+            Some("b@x"),
+            Some("repo"),
+            "sha_high",
+            None,
+            None,
+            None,
+            900,
+        )
+        .await
+        .unwrap();
+
+        // Higher priority is claimed first.
+        let first = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(first.commit_hash, "sha_high");
+        assert_eq!(first.status, FetchStatus::Fetching);
+        assert_eq!(first.attempts, 1);
+        assert!(first.first_attempt_at.is_some());
+        assert!(first.locked_at.is_some());
+
+        // A claimed row is not handed out again.
+        let second = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(second.commit_hash, "sha_low");
+
+        assert!(db.lock_pending_fetch().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_queue_enqueue_is_idempotent() {
+        let db = setup_db().await;
+        db.enqueue_fetch(None, None, Some("repo"), "sha", None, None, None, 500)
+            .await
+            .unwrap();
+        db.enqueue_fetch(None, None, Some("repo"), "sha", None, None, None, 500)
+            .await
+            .unwrap();
+        let _ = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert!(db.lock_pending_fetch().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_queue_enqueue_distinct_cover_ids_not_dropped() {
+        let db = setup_db().await;
+        // Two distinct MRs for the same commit range and repo must both be enqueued
+        db.enqueue_fetch(
+            None,
+            Some("mr-1-base..head@sashiko.local"),
+            Some("repo"),
+            "base..head",
+            Some("http://mr1"),
+            Some("MR 1"),
+            Some(1),
+            500,
+        )
+        .await
+        .unwrap();
+        db.enqueue_fetch(
+            None,
+            Some("mr-2-base..head@sashiko.local"),
+            Some("repo"),
+            "base..head",
+            Some("http://mr2"),
+            Some("MR 2"),
+            Some(2),
+            500,
+        )
+        .await
+        .unwrap();
+
+        let first = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(
+            first.cover_letter_message_id.as_deref(),
+            Some("mr-1-base..head@sashiko.local")
+        );
+        let second = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(
+            second.cover_letter_message_id.as_deref(),
+            Some("mr-2-base..head@sashiko.local")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_migrate_fetch_queue_on_version_1_db() {
+        let settings = DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&settings).await.unwrap();
+        // Simulate a legacy DB already at user_version 1 without fetch_queue
+        let schema = include_str!("migrations/001_initial.sql");
+        db.conn.execute_batch(schema).await.unwrap();
+        db.conn
+            .execute("PRAGMA user_version = 1", ())
+            .await
+            .unwrap();
+
+        // migrate() must create fetch_queue even though user_version == 1
+        db.migrate().await.unwrap();
+
+        db.enqueue_fetch(None, None, Some("repo"), "sha", None, None, None, 500)
+            .await
+            .unwrap();
+        let row = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(row.commit_hash, "sha");
+    }
+
+    #[tokio::test]
+    async fn test_create_patchset_matches_placeholder_without_suffix() {
+        let db = setup_db().await;
+        // Create a placeholder with unsuffixed ID (as might exist from older webhooks)
+        let placeholder_id = "mr-99-base..head";
+        let pid = db
+            .create_fetching_patchset(
+                placeholder_id,
+                "Fetching MR 99",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Ingestion passes suffixed root_msg_id as cover_letter_id
+        let suffixed_id = "mr-99-base..head@sashiko.local";
+        let thread_id = db
+            .ensure_thread_for_message(suffixed_id, 1000)
+            .await
+            .unwrap();
+        let matched_id = db
+            .create_patchset_with_priority(
+                thread_id,
+                Some(suffixed_id),
+                "commit_sha_1",
+                "MR 99 Subject",
+                "Author",
+                1000,
+                2,
+                1,
+                "to",
+                "cc",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(matched_id, Some(pid));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_queue_retry_gating() {
+        let db = setup_db().await;
+        db.enqueue_fetch(None, None, Some("repo"), "sha", None, None, None, 500)
+            .await
+            .unwrap();
+        let row = db.lock_pending_fetch().await.unwrap().unwrap();
+
+        // A retry scheduled in the far future must not be claimable now.
+        db.set_fetch_retry_at(row.id, 4_000_000_000, "transient")
+            .await
+            .unwrap();
+        assert!(db.lock_pending_fetch().await.unwrap().is_none());
+
+        // A retry scheduled in the past becomes claimable again.
+        db.set_fetch_retry_at(row.id, 1, "transient").await.unwrap();
+        let again = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(again.attempts, 2);
+        assert_eq!(again.commit_hash, "sha");
+        assert_eq!(again.last_error.as_deref(), Some("transient"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_queue_demotes_retries_behind_fresh_work() {
+        let db = setup_db().await;
+        // Enqueue an older item with high priority and simulate a failed attempt
+        // whose retry window has already elapsed.
+        db.enqueue_fetch(
+            None,
+            None,
+            Some("repo"),
+            "retrying_sha",
+            None,
+            None,
+            None,
+            600,
+        )
+        .await
+        .unwrap();
+        let first_attempt = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(first_attempt.commit_hash, "retrying_sha");
+        assert_eq!(first_attempt.attempts, 1);
+        db.set_fetch_retry_at(first_attempt.id, 1, "transient")
+            .await
+            .unwrap();
+
+        // Enqueue a newer fresh item (attempts = 0) with default priority.
+        db.enqueue_fetch(None, None, Some("repo"), "fresh_sha", None, None, None, 500)
+            .await
+            .unwrap();
+
+        // Fresh work (attempts = 0) must be claimed ahead of due retries (attempts = 1).
+        let claimed_first = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(claimed_first.commit_hash, "fresh_sha");
+        assert_eq!(claimed_first.attempts, 1);
+
+        let claimed_second = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(claimed_second.commit_hash, "retrying_sha");
+        assert_eq!(claimed_second.attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_queue_done_and_failed_are_terminal() {
+        let db = setup_db().await;
+        db.enqueue_fetch(None, None, Some("r"), "done_sha", None, None, None, 500)
+            .await
+            .unwrap();
+        db.enqueue_fetch(None, None, Some("r"), "fail_sha", None, None, None, 500)
+            .await
+            .unwrap();
+        let a = db.lock_pending_fetch().await.unwrap().unwrap();
+        db.mark_fetch_done(a.id).await.unwrap();
+        let b = db.lock_pending_fetch().await.unwrap().unwrap();
+        db.mark_fetch_failed(b.id, "boom").await.unwrap();
+        assert!(db.lock_pending_fetch().await.unwrap().is_none());
+    }
+
+    async fn count_supporting(db: &Database) -> i64 {
+        let mut rows = db
+            .conn
+            .query("SELECT COUNT(*) FROM fetch_supporting_commits", ())
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_fetch_supporting_commits_roundtrip() {
+        let db = setup_db().await;
+        let supporting = vec!["original_sha".to_string(), "base_sha".to_string()];
+        db.enqueue_fetch_with_support(
+            None,
+            Some("cover@x"),
+            Some("repo"),
+            "resolution_sha",
+            None,
+            None,
+            None,
+            500,
+            &supporting,
+        )
+        .await
+        .unwrap();
+
+        let row = db.lock_pending_fetch().await.unwrap().unwrap();
+        // Only the resolution commit is ingested; the original and base commits
+        // ride along as supporting commits, preserved in insertion order.
+        assert_eq!(row.commit_hash, "resolution_sha");
+        assert_eq!(row.supporting_commits, supporting);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_without_support_has_no_supporting_commits() {
+        let db = setup_db().await;
+        db.enqueue_fetch(None, None, Some("repo"), "sha", None, None, None, 500)
+            .await
+            .unwrap();
+        let row = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert!(row.supporting_commits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_mark_fetch_done_removes_supporting_commits() {
+        let db = setup_db().await;
+        db.enqueue_fetch_with_support(
+            None,
+            None,
+            Some("repo"),
+            "resolution_sha",
+            None,
+            None,
+            None,
+            500,
+            &["original_sha".to_string(), "base_sha".to_string()],
+        )
+        .await
+        .unwrap();
+        let row = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(count_supporting(&db).await, 2);
+
+        db.mark_fetch_done(row.id).await.unwrap();
+        // Completing a fetch removes its supporting-commit child rows so the
+        // table stays bounded to in-flight work.
+        assert_eq!(count_supporting(&db).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_sweep_ghost_fetches_reclaims_expired_lease() {
+        let db = setup_db().await;
+        db.enqueue_fetch(None, None, Some("r"), "sha", None, None, None, 500)
+            .await
+            .unwrap();
+        let row = db.lock_pending_fetch().await.unwrap().unwrap();
+
+        // A generous lease keeps the in-flight row locked (nothing reclaimed).
+        assert_eq!(db.sweep_ghost_fetches(1_000_000_000).await.unwrap(), 0);
+        assert!(db.lock_pending_fetch().await.unwrap().is_none());
+
+        // A negative lease treats every lease as already expired, so the
+        // ghosted row is reclaimed and becomes claimable again.
+        assert_eq!(db.sweep_ghost_fetches(-100_000).await.unwrap(), 1);
+        let again = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(again.id, row.id);
+    }
+
+    #[tokio::test]
+    async fn test_renew_fetch_lease() {
+        let db = setup_db().await;
+        db.enqueue_fetch(None, None, Some("r"), "sha", None, None, None, 500)
+            .await
+            .unwrap();
+        let row = db.lock_pending_fetch().await.unwrap().unwrap();
+        let initial_attempts = row.attempts;
+        let initial_locked_at = row.locked_at.unwrap();
+
+        // Successful lease renewal using current attempts.
+        let updated = db
+            .renew_fetch_lease(row.id, initial_attempts)
+            .await
+            .unwrap();
+        assert!(updated);
+
+        // Attempting renewal with non-matching attempts fails.
+        let wrong_attempts = db
+            .renew_fetch_lease(row.id, initial_attempts + 1)
+            .await
+            .unwrap();
+        assert!(!wrong_attempts);
+
+        let non_existent = db
+            .renew_fetch_lease(999_999, initial_attempts)
+            .await
+            .unwrap();
+        assert!(!non_existent);
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT locked_at FROM fetch_queue WHERE id = ?",
+                libsql::params![row.id],
+            )
+            .await
+            .unwrap();
+        let renewed_locked_at: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert!(renewed_locked_at >= initial_locked_at);
+
+        // Sweep ghost fetches to return row to Pending. While in Pending, renewal fails.
+        assert_eq!(db.sweep_ghost_fetches(-100_000).await.unwrap(), 1);
+        let pending_renew = db
+            .renew_fetch_lease(row.id, initial_attempts)
+            .await
+            .unwrap();
+        assert!(!pending_renew);
+
+        // Another worker reclaims the row, incrementing attempts (e.g. 1 -> 2).
+        let reclaimed = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(reclaimed.id, row.id);
+        assert_eq!(reclaimed.attempts, initial_attempts + 1);
+
+        // The stalled worker attempting renewal with stale attempts fails,
+        // preventing ABA lease hijacking when reclaimed by another worker.
+        let stale = db
+            .renew_fetch_lease(row.id, initial_attempts)
+            .await
+            .unwrap();
+        assert!(!stale);
+
+        // The new worker with current attempts can successfully renew.
+        let active = db
+            .renew_fetch_lease(row.id, reclaimed.attempts)
+            .await
+            .unwrap();
+        assert!(active);
+    }
+
+    #[test]
+    fn test_repo_url_from_subject() {
+        assert_eq!(
+            repo_url_from_subject("Fetching abc123 from sso://prodkernel/kernel/icebreaker..."),
+            Some("sso://prodkernel/kernel/icebreaker".to_string())
+        );
+        assert_eq!(
+            repo_url_from_subject("Fetching abc123 from https://example.com/repo.git..."),
+            Some("https://example.com/repo.git".to_string())
+        );
+        assert_eq!(repo_url_from_subject("Fetching abc123 from local..."), None);
+        assert_eq!(repo_url_from_subject("Fetching thread <m@id>..."), None);
+        assert_eq!(repo_url_from_subject("some unrelated subject"), None);
+    }
+
+    #[tokio::test]
+    async fn test_get_stuck_fetch_placeholders_finds_orphans() {
+        let db = setup_db().await;
+        // A patchset stuck in 'Fetching' with no queue row is an orphan.
+        db.create_fetching_patchset(
+            "orphan@sashiko.local",
+            "Fetching x",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let stuck = db.get_stuck_fetch_placeholders().await.unwrap();
+        assert_eq!(stuck.len(), 1);
+        assert_eq!(
+            stuck[0].cover_letter_message_id.as_deref(),
+            Some("orphan@sashiko.local")
+        );
+
+        // Once an active queue row exists, it is no longer reported.
+        let pid = stuck[0].patchset_id;
+        db.enqueue_fetch(
+            Some(pid),
+            Some("orphan@sashiko.local"),
+            None,
+            "orphan",
+            None,
+            None,
+            None,
+            500,
+        )
+        .await
+        .unwrap();
+        assert!(db.get_stuck_fetch_placeholders().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn test_patchset_priority_routing() {
         let db = setup_db().await;
 
