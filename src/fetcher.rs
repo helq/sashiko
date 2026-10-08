@@ -389,18 +389,7 @@ impl FetchWorker {
                 );
             }
         } else {
-            let backoff = backoff_secs(row.attempts);
-            warn!(
-                "Fetch {} for {} failed (attempt {}), retrying in {}s: {}",
-                row.id, row.commit_hash, row.attempts, backoff, msg
-            );
-            if let Err(e) = self
-                .db
-                .set_fetch_retry_at(row.id, now + backoff, &msg)
-                .await
-            {
-                error!("Failed to schedule retry for fetch {}: {}", row.id, e);
-            }
+            self.schedule_retry(row, &msg, now).await;
         }
     }
 
@@ -604,6 +593,18 @@ impl FetchWorker {
         }
         Ok(())
     }
+
+    async fn schedule_retry(&self, row: &FetchQueueRow, msg: &str, now: i64) {
+        let backoff = backoff_secs(row.attempts);
+        warn!(
+            "Fetch {} for {} failed (attempt {}), retrying in {}s: {}",
+            row.id, row.commit_hash, row.attempts, backoff, msg
+        );
+        if let Err(e) = self.db.set_fetch_retry_at(row.id, now + backoff, msg).await {
+            error!("Failed to schedule retry for fetch {}: {}", row.id, e);
+        }
+    }
+
     fn article_id_for(row: &FetchQueueRow) -> String {
         match row.mr_number {
             Some(number) => format!("mr-{}-{}", number, row.commit_hash),
