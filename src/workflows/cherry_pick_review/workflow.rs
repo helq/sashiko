@@ -36,7 +36,8 @@ use crate::workflows::linux_patch_review;
 use super::prompts::{
     ANALYSIS_FORMAT_GUIDANCE, CHERRY_PICK_CONFLICT_RESOLUTION_INSTRUCTION,
     CHERRY_PICK_DEDUPLICATION_INSTRUCTION, DROPPED_CHANGES, MERGE_CONFLICT_REVIEW_FRAMING,
-    MERGE_CORRECTNESS, PLANNING, PREFETCHED_CONTEXT_HEADER, SEMANTIC_INTENT,
+    MERGE_CORRECTNESS, ORIGIN_CLASSIFICATION, PLANNING, PREFETCHED_CONTEXT_HEADER, SEMANTIC_INTENT,
+    VERIFICATION,
 };
 use super::synthesis;
 
@@ -887,6 +888,61 @@ fn format_stage9_feedback(violation: &str) -> String {
 }
 
 #[allow(dead_code)]
+fn build_stage10(max_turns: usize, temperature: f32) -> Stage<CherryPickState, Value> {
+    Stage::builder("10")
+        .system_prompt(cherry_pick_system_prompt(true))
+        .user_prompt(
+            PromptTemplate::new(
+                "{{user}}\n\n@include(\"false-positive-guide.md\")\n@include(\"severity.md\")",
+            )
+            .with_var("user", move |s: &CherryPickState| {
+                (synthesis::stage10_builder())(VERIFICATION, s).0
+            })
+            .include_file("false-positive-guide.md")
+            .include_file("severity.md"),
+        )
+        .output_format(
+            OutputFormat::json()
+                .with_validator(validate_stage10)
+                .with_feedback_formatter(format_stage10_feedback),
+        )
+        .tools(ToolScope::All)
+        .max_turns(max_turns)
+        .temperature(temperature)
+        .on_recitation(recitation_reminder())
+        .reduce(|state: &mut CherryPickState, val: Value| {
+            state.findings = Some(val.get("findings").cloned().unwrap_or(val));
+        })
+        .build()
+}
+
+#[allow(dead_code)]
+fn build_stage_origin(max_turns: usize, temperature: f32) -> Stage<CherryPickState, Value> {
+    Stage::builder("11")
+        .system_prompt(cherry_pick_system_prompt(true))
+        .user_prompt(
+            PromptTemplate::new("{{user}}").with_var("user", |s: &CherryPickState| {
+                (synthesis::origin_builder())(ORIGIN_CLASSIFICATION, s).0
+            }),
+        )
+        .output_format(
+            OutputFormat::json()
+                .with_validator(validate_stage_origin)
+                .with_feedback_formatter(format_stage_origin_feedback),
+        )
+        .tools(ToolScope::All)
+        .max_turns(max_turns)
+        .temperature(temperature)
+        .on_recitation(recitation_reminder())
+        .on_validation_exhausted(|_state: &mut CherryPickState| {
+            tracing::warn!("Origin classification validation exhausted; keeping Stage 10 findings with default origin.");
+        })
+        .reduce(|state: &mut CherryPickState, val: Value| {
+            state.findings = Some(val.get("findings").cloned().unwrap_or(val));
+        })
+        .build()
+}
+
 fn validate_stage10(val: &Value, _state: &CherryPickState) -> Result<(), String> {
     let arr = match val.get("findings").and_then(|f| f.as_array()) {
         Some(a) => a,
@@ -904,7 +960,6 @@ fn validate_stage10(val: &Value, _state: &CherryPickState) -> Result<(), String>
     Ok(())
 }
 
-#[allow(dead_code)]
 fn validate_stage_origin(val: &Value, state: &CherryPickState) -> Result<(), String> {
     validate_stage10(val, state)?;
     let arr = val.get("findings").and_then(|f| f.as_array()).unwrap();
@@ -923,7 +978,6 @@ fn validate_stage_origin(val: &Value, state: &CherryPickState) -> Result<(), Str
     Ok(())
 }
 
-#[allow(dead_code)]
 fn format_stage_origin_feedback(violation: &str) -> String {
     let msg = if violation.starts_with("Failed to parse JSON from output:") {
         "missing 'findings' array in output"
@@ -935,7 +989,7 @@ fn format_stage_origin_feedback(violation: &str) -> String {
         msg
     )
 }
-#[allow(dead_code)]
+
 fn format_stage10_feedback(violation: &str) -> String {
     format!(
         "\n\nPrevious attempt was rejected: {}. You MUST return ONLY a JSON object containing 'findings' array.",
