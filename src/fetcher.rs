@@ -16,7 +16,6 @@ use crate::db::{Database, FetchQueueRow};
 use crate::events::{Event, MessageSource};
 use crate::utils::redact_secret;
 use anyhow::{Result, anyhow};
-use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::{Output, Stdio};
 use std::sync::Arc;
@@ -613,85 +612,6 @@ impl FetchWorker {
         }
         Ok(())
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct FetchRequest {
-    pub repo_url: Option<String>,
-    pub commit_hash: String,
-    pub mr_url: Option<String>,
-    pub mr_title: Option<String>,
-    pub mr_number: Option<i64>,
-}
-
-#[allow(dead_code)]
-pub struct FetchAgent {
-    repo_path: PathBuf,
-    rx: mpsc::Receiver<FetchRequest>,
-    main_tx: mpsc::Sender<Event>,
-    #[allow(clippy::type_complexity)]
-    mr_metadata: HashMap<String, (Option<String>, Option<String>, Option<i64>)>,
-    gitlab_token: Option<String>,
-}
-
-#[allow(dead_code)]
-impl FetchAgent {
-    pub fn new(
-        repo_path: PathBuf,
-        main_tx: mpsc::Sender<Event>,
-        gitlab_token: Option<String>,
-    ) -> (Self, mpsc::Sender<FetchRequest>) {
-        let (tx, rx) = mpsc::channel(100);
-        (
-            Self {
-                repo_path,
-                rx,
-                main_tx,
-                mr_metadata: HashMap::new(),
-                gitlab_token,
-            },
-            tx,
-        )
-    }
-
-    pub async fn run(mut self) {
-        info!("FetchAgent started");
-        let mut queue: HashMap<Option<String>, HashSet<String>> = HashMap::new();
-        let mut ticker = interval(Duration::from_secs(10));
-
-        loop {
-            tokio::select! {
-                Some(req) = self.rx.recv() => {
-                    if req.mr_url.is_some() || req.mr_title.is_some() || req.mr_number.is_some() {
-                        self.mr_metadata.insert(
-                            req.commit_hash.clone(),
-                            (req.mr_url.clone(), req.mr_title.clone(), req.mr_number)
-                        );
-                    }
-                    queue.entry(req.repo_url)
-                        .or_default()
-                        .insert(req.commit_hash);
-                }
-                _ = ticker.tick() => {
-                    queue.clear();
-                }
-            }
-        }
-    }
-
-    pub async fn fetch_and_submit_batch(&mut self, repo_url: Option<String>, commits: Vec<String>) {
-        let mut queue: HashMap<Option<String>, HashSet<String>> = HashMap::new();
-        queue.entry(repo_url).or_default().extend(commits);
-        self.process_queue(&mut queue).await;
-    }
-
-    async fn process_queue(&self, queue: &mut HashMap<Option<String>, HashSet<String>>) {
-        let _ = queue.drain();
-    }
-}
-
-#[allow(dead_code)]
-impl FetchWorker {
     fn get_remote_name(&self, url: &str) -> String {
         // Use a hash of the URL to ensure safe and unique remote names
         use std::collections::hash_map::DefaultHasher;
@@ -1256,39 +1176,6 @@ mod tests {
             worker.is_present(&commit_sha).await,
             "Commit SHA should be considered present"
         );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_process_queue_drains_queue() -> Result<()> {
-        let temp_dir = tempfile::tempdir()?;
-        let repo_path = temp_dir.path().to_path_buf();
-
-        crate::git_cmd::in_dir_async(&repo_path)
-            .arg("init")
-            .output()
-            .await?;
-
-        let (tx, _rx) = mpsc::channel(10);
-        let (agent, _) = FetchAgent::new(repo_path, tx, None);
-
-        let req = FetchRequest {
-            repo_url: Some("https://oauth2:glpat_secret123@127.0.0.1:0/group/repo.git".to_string()),
-            commit_hash: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string(),
-            mr_url: None,
-            mr_title: None,
-            mr_number: None,
-        };
-
-        let mut queue: HashMap<Option<String>, HashSet<String>> = HashMap::new();
-        queue
-            .entry(req.repo_url)
-            .or_default()
-            .insert(req.commit_hash.clone());
-
-        agent.process_queue(&mut queue).await;
-        assert!(queue.is_empty());
 
         Ok(())
     }
