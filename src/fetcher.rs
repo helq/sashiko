@@ -12,22 +12,42 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::db::Database;
 use crate::events::{Event, MessageSource};
 use crate::utils::redact_secret;
 use anyhow::{Result, anyhow};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::{Output, Stdio};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, interval};
 use tracing::{error, info, warn};
 
+/// How often the worker polls the durable queue for due work.
+#[allow(dead_code)]
+const POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// How often expired leases from dead workers are reclaimed.
+#[allow(dead_code)]
+const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+/// A claimed fetch whose worker stops updating it for this long is treated as a
+/// ghost and reclaimed by the sweep.
+#[allow(dead_code)]
+const GHOST_LEASE_SECS: i64 = 600;
+/// Total wall-clock window a fetch keeps retrying before it is failed.
+#[allow(dead_code)]
+const RETRY_WINDOW_SECS: i64 = 24 * 60 * 60;
 /// First retry delay; subsequent delays double up to BACKOFF_CAP_SECS.
 #[allow(dead_code)]
 const BACKOFF_BASE_SECS: i64 = 30;
 /// Maximum delay between retries.
 #[allow(dead_code)]
 const BACKOFF_CAP_SECS: i64 = 600;
+
+/// Maximum number of fetch_queue rows to claim and pre-fetch in a single
+/// `git fetch` call. Batching improves server-side pack negotiation.
+#[allow(dead_code)]
+const BATCH_SIZE: usize = 20;
 
 /// Marker error for failures that can never succeed on retry (e.g. a commit
 /// is missing and the row has no remote to fetch from). These bypass the
@@ -124,6 +144,39 @@ struct TaskAbortGuard(tokio::task::JoinHandle<()>);
 impl Drop for TaskAbortGuard {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+/// Durable, restart-safe git fetch worker.
+///
+/// Replaces the previous in-memory `FetchAgent` channel. Fetch requests live in
+/// the `fetch_queue` table; this worker claims them under a lease, performs the
+/// git fetch and patch extraction, and either completes them, schedules a
+/// backoff retry, or (after RETRY_WINDOW_SECS) fails them terminally. Because
+/// all state lives in the database, requests survive restarts and crashed
+/// workers are recovered by the ghost sweep.
+#[allow(dead_code)]
+pub struct FetchWorker {
+    repo_path: PathBuf,
+    db: Arc<Database>,
+    main_tx: mpsc::Sender<Event>,
+    gitlab_token: Option<String>,
+}
+
+impl FetchWorker {
+    #[allow(dead_code)]
+    pub fn new(
+        repo_path: PathBuf,
+        db: Arc<Database>,
+        main_tx: mpsc::Sender<Event>,
+        gitlab_token: Option<String>,
+    ) -> Self {
+        Self {
+            repo_path,
+            db,
+            main_tx,
+            gitlab_token,
+        }
     }
 }
 
