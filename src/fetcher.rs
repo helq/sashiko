@@ -1633,4 +1633,75 @@ mod tests {
         worker_task.abort();
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_ensure_present_checks_supporting_commits() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let repo_path = temp_dir.path().to_path_buf();
+
+        crate::git_cmd::in_dir_async(&repo_path)
+            .arg("init")
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(&repo_path)
+            .args(["config", "user.name", "Test User"])
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(&repo_path)
+            .args(["config", "user.email", "test@example.com"])
+            .output()
+            .await?;
+
+        let file_path = repo_path.join("file.txt");
+        let mut file = File::create(&file_path)?;
+        writeln!(file, "content")?;
+        crate::git_cmd::in_dir_async(&repo_path)
+            .args(["add", "."])
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(&repo_path)
+            .args(["commit", "-m", "Commit 1"])
+            .output()
+            .await?;
+
+        let output = crate::git_cmd::in_dir_async(&repo_path)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .await?;
+        let commit1 = String::from_utf8(output.stdout)?.trim().to_string();
+
+        let worker = test_worker(repo_path.clone()).await;
+
+        let row = FetchQueueRow {
+            id: 1,
+            patchset_id: None,
+            cover_letter_message_id: None,
+            repo_url: None,
+            commit_hash: commit1.clone(),
+            mr_url: None,
+            mr_title: None,
+            mr_number: None,
+            status: crate::db::FetchStatus::Pending,
+            attempts: 0,
+            first_attempt_at: None,
+            next_retry_at: None,
+            locked_at: None,
+            last_error: None,
+            priority: 500,
+            created_at: 0,
+            supporting_commits: vec!["missing_sha_1234567890".to_string()],
+        };
+
+        // ensure_present must fail because supporting_commits contains a missing SHA
+        assert!(worker.ensure_present(&row).await.is_err());
+
+        // When supporting_commits is present locally, ensure_present must succeed
+        let row_valid = FetchQueueRow {
+            supporting_commits: vec![commit1.clone()],
+            ..row
+        };
+        assert!(worker.ensure_present(&row_valid).await.is_ok());
+
+        Ok(())
+    }
 }
