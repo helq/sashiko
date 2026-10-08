@@ -179,6 +179,67 @@ impl FetchWorker {
         }
     }
 
+    #[allow(dead_code)]
+    pub async fn run(self) {
+        info!("FetchWorker started");
+
+        loop {
+            // Claim up to BATCH_SIZE rows and pre-fetch their objects in a
+            // single `git fetch` call. Batching lets the server compute one
+            // optimal pack for many wants, avoiding the pathological 11M-object
+            // downloads that happen when unreachable SHAs are fetched one at a
+            // time with poor negotiation.
+            let mut batch = Vec::new();
+            loop {
+                if batch.len() >= BATCH_SIZE {
+                    break;
+                }
+                match self.db.lock_pending_fetch().await {
+                    Ok(Some(row)) => batch.push(row),
+                    Ok(None) => break,
+                    Err(e) => {
+                        error!("Failed to claim pending fetch: {}", e);
+                        break;
+                    }
+                }
+            }
+            if batch.is_empty() {
+                tokio::time::sleep(POLL_INTERVAL).await;
+                continue;
+            }
+
+            // Renew leases before prefetching so all rows have a fresh
+            // lease window even if claiming the batch took time.
+            for row in &batch {
+                if let Err(e) = self.db.renew_fetch_lease(row.id, row.attempts).await {
+                    warn!("Failed to renew initial lease for fetch {}: {}", row.id, e);
+                }
+            }
+
+            // Pre-fetch all missing objects in one batch call.
+            self.batch_prefetch(&batch).await;
+
+            // Process each row individually for ingestion.
+            for row in batch {
+                match self.db.renew_fetch_lease(row.id, row.attempts).await {
+                    Ok(false) => {
+                        warn!(
+                            "Fetch lease for {} expired/lost to sweeper; skipping",
+                            row.id
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        error!("Database error renewing fetch lease for {}: {}", row.id, e);
+                        continue;
+                    }
+                    Ok(true) => {}
+                }
+                self.process_row(row).await;
+            }
+        }
+    }
+
     /// Decide whether to retry (with backoff) or terminally fail a fetch.
     #[allow(dead_code)]
     async fn handle_failure(&self, row: &FetchQueueRow, error: anyhow::Error) {
@@ -1302,6 +1363,89 @@ mod tests {
             .await?;
         assert!(!out_blocked.status.success());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fetch_worker_drains_batches_without_poll_stall() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let repo_path = temp_dir.path().to_path_buf();
+        crate::git_cmd::in_dir_async(&repo_path)
+            .args(["init", "-b", "main"])
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(&repo_path)
+            .args(["config", "user.name", "Test"])
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(&repo_path)
+            .args(["config", "user.email", "test@test.com"])
+            .output()
+            .await?;
+        std::fs::write(repo_path.join("file.txt"), "hello\n")?;
+        crate::git_cmd::in_dir_async(&repo_path)
+            .args(["add", "."])
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(&repo_path)
+            .args(["commit", "-m", "init"])
+            .output()
+            .await?;
+
+        let head = String::from_utf8(
+            crate::git_cmd::in_dir_async(&repo_path)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .await?
+                .stdout,
+        )?
+        .trim()
+        .to_string();
+
+        let settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Arc::new(Database::new(&settings).await?);
+        db.migrate().await?;
+        let (tx, mut rx) = mpsc::channel(100);
+        let worker = FetchWorker::new(repo_path, Arc::clone(&db), tx, None);
+
+        // Enqueue BATCH_SIZE + 2 items (22 items)
+        for i in 0..(BATCH_SIZE + 2) {
+            db.enqueue_fetch(
+                None,
+                Some(&format!("cover-{}", i)),
+                None,
+                &head,
+                None,
+                None,
+                None,
+                500,
+            )
+            .await?;
+        }
+
+        // Spawn worker.run()
+        let worker_task = tokio::spawn(async move {
+            worker.run().await;
+        });
+
+        let mut count = 0;
+        while count < BATCH_SIZE + 2 {
+            match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await {
+                Ok(Some(Event::PatchSubmitted { .. })) => count += 1,
+                _ => break,
+            }
+        }
+        assert_eq!(
+            count,
+            BATCH_SIZE + 2,
+            "Worker should have drained all 22 items across 2 batches immediately"
+        );
+        assert!(db.lock_pending_fetch().await?.is_none());
+
+        worker_task.abort();
         Ok(())
     }
 }
