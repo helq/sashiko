@@ -575,6 +575,7 @@ async fn submit_patch(
             let req = FetchRequest {
                 repo_url: repo,
                 commit_hash: sha,
+                supporting_commits: vec![],
                 mr_url: None,
                 mr_title: None,
                 mr_number: None,
@@ -2366,6 +2367,7 @@ async fn forge_webhook(
     let req = FetchRequest {
         repo_url: metadata.repo_url,
         commit_hash: commit_range,
+        supporting_commits: vec![],
         mr_url: metadata.pr_url,
         mr_title: metadata.pr_title,
         mr_number: Some(metadata.pr_number),

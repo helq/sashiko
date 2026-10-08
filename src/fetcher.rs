@@ -26,6 +26,7 @@ use tracing::{error, info, warn};
 pub struct FetchRequest {
     pub repo_url: Option<String>,
     pub commit_hash: String,
+    pub supporting_commits: Vec<String>,
     pub mr_url: Option<String>,
     pub mr_title: Option<String>,
     pub mr_number: Option<i64>,
@@ -37,6 +38,7 @@ pub struct FetchAgent {
     main_tx: mpsc::Sender<Event>,
     #[allow(clippy::type_complexity)]
     mr_metadata: HashMap<String, (Option<String>, Option<String>, Option<i64>)>,
+    supporting_commits: HashMap<String, Vec<String>>,
     gitlab_token: Option<String>,
 }
 
@@ -53,6 +55,7 @@ impl FetchAgent {
                 rx,
                 main_tx,
                 mr_metadata: HashMap::new(),
+                supporting_commits: HashMap::new(),
                 gitlab_token,
             },
             tx,
@@ -71,6 +74,12 @@ impl FetchAgent {
                         self.mr_metadata.insert(
                             req.commit_hash.clone(),
                             (req.mr_url.clone(), req.mr_title.clone(), req.mr_number)
+                        );
+                    }
+                    if !req.supporting_commits.is_empty() {
+                        self.supporting_commits.insert(
+                            req.commit_hash.clone(),
+                            req.supporting_commits,
                         );
                     }
                     queue.entry(req.repo_url)
@@ -92,8 +101,10 @@ impl FetchAgent {
         self.process_queue(&mut queue).await;
     }
 
-    async fn process_queue(&self, queue: &mut HashMap<Option<String>, HashSet<String>>) {
+    async fn process_queue(&mut self, queue: &mut HashMap<Option<String>, HashSet<String>>) {
         info!("Processing fetch queue with {} repos", queue.len());
+
+        let all_commits: Vec<String> = queue.values().flat_map(|s| s.iter().cloned()).collect();
 
         for (url_opt, commits) in queue.drain() {
             if commits.is_empty() {
@@ -369,6 +380,11 @@ impl FetchAgent {
                     }
                 }
             }
+        }
+
+        for commit in all_commits {
+            self.supporting_commits.remove(&commit);
+            self.mr_metadata.remove(&commit);
         }
     }
 
@@ -775,11 +791,12 @@ mod tests {
             .await?;
 
         let (tx, mut rx) = mpsc::channel(10);
-        let (agent, _) = FetchAgent::new(repo_path, tx, None);
+        let (mut agent, _) = FetchAgent::new(repo_path, tx, None);
 
         let req = FetchRequest {
             repo_url: Some("https://oauth2:glpat_secret123@127.0.0.1:0/group/repo.git".to_string()),
             commit_hash: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+            supporting_commits: vec![],
             mr_url: None,
             mr_title: None,
             mr_number: None,
