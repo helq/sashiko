@@ -66,6 +66,8 @@ pub struct StagePolicy<S = ()> {
     pub recitation_policy: RecitationPolicy,
     /// Optional per-stage reasoning effort override.
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Optional suffix appended to the environment context tag for this stage.
+    pub context_tag_suffix: Option<String>,
     /// Optional fallback callback invoked if validation retries are exhausted.
     pub on_validation_exhausted: Option<ValidationFallback<S>>,
 }
@@ -79,6 +81,7 @@ impl<S> Clone for StagePolicy<S> {
             tools: self.tools.clone(),
             recitation_policy: self.recitation_policy.clone(),
             reasoning_effort: self.reasoning_effort,
+            context_tag_suffix: self.context_tag_suffix.clone(),
             on_validation_exhausted: self.on_validation_exhausted.clone(),
         }
     }
@@ -93,6 +96,7 @@ impl<S> std::fmt::Debug for StagePolicy<S> {
             .field("tools", &self.tools)
             .field("recitation_policy", &self.recitation_policy)
             .field("reasoning_effort", &self.reasoning_effort)
+            .field("context_tag_suffix", &self.context_tag_suffix)
             .field(
                 "on_validation_exhausted",
                 &self.on_validation_exhausted.as_ref().map(|_| "<fallback>"),
@@ -116,6 +120,7 @@ impl<S> Default for StagePolicy<S> {
                     .to_string(),
             ),
             reasoning_effort: None,
+            context_tag_suffix: None,
             on_validation_exhausted: None,
         }
     }

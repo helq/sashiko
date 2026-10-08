@@ -235,7 +235,16 @@ impl<S: 'static, T: 'static> StageBuilder<S, T> {
         if policy.on_validation_exhausted.is_none() {
             policy.on_validation_exhausted = self.policy.on_validation_exhausted.clone();
         }
+        if policy.context_tag_suffix.is_none() {
+            policy.context_tag_suffix = self.policy.context_tag_suffix.clone();
+        }
         self.policy = policy;
+        self
+    }
+
+    /// Configures an optional suffix appended to the environment context tag for this stage.
+    pub fn context_tag_suffix(mut self, suffix: impl Into<String>) -> Self {
+        self.policy.context_tag_suffix = Some(suffix.into());
         self
     }
 
@@ -554,6 +563,17 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
         let log_user_prompt = self.user_prompt.render_for_log(state);
 
         let stage_name = self.name;
+        let context_tag = match (&env.context_tag, &self.policy.context_tag_suffix) {
+            (Some(prefix), Some(suffix)) => {
+                if let Some(stripped) = prefix.trim_end().strip_suffix(']') {
+                    Some(format!("{stripped} {suffix}] "))
+                } else {
+                    Some(format!("{prefix} {suffix}] "))
+                }
+            }
+            (Some(prefix), None) => Some(prefix.clone()),
+            (None, _) => None,
+        };
         let run_result = {
             let mut session = StageSession {
                 stage: self,
@@ -562,7 +582,7 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
                 system_prompt,
                 user_prompt,
                 log_user_prompt,
-                context_tag: env.context_tag.clone(),
+                context_tag,
                 recitation_fallback_active: false,
                 last_tool_call: None,
             };
@@ -1126,5 +1146,41 @@ mod tests {
         let mut state = String::new();
         (stage.reducer)(&mut state, "ok".to_string());
         assert_eq!(state, "plain:ok");
+    }
+
+    #[tokio::test]
+    async fn test_context_tag_suffix_multibyte_utf8() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = std::sync::Arc::new(crate::workflow::stage::tests::ToolCallingProvider {
+            turn: std::sync::Mutex::new(0),
+            seen: std::sync::Mutex::new(Vec::new()),
+            calls: Vec::new(),
+            calling_turns: 0,
+        });
+        let env = crate::workflow::WorkflowEnv {
+            provider: provider.clone(),
+            tools: std::sync::Arc::new(crate::toolbox::ToolBox::new(
+                tmp.path().to_path_buf(),
+                None,
+            )),
+            base_dir: tmp.path(),
+            context_tag: Some("[author:Søren—]".to_string()),
+        };
+
+        let stage: crate::workflow::Stage<crate::workflow::stage::tests::EmptyState, String> =
+            crate::workflow::Stage::builder("test_utf8")
+                .user_prompt(crate::workflow::PromptTemplate::new("go"))
+                .output_format(crate::workflow::OutputFormat::text())
+                .context_tag_suffix("s:1")
+                .reduce(|_: &mut crate::workflow::stage::tests::EmptyState, _: String| {})
+                .build();
+
+        let (_outcome, _mutation) = stage
+            .execute_isolated(&env, &crate::workflow::stage::tests::EmptyState, None)
+            .await
+            .unwrap();
+
+        let seen = provider.seen.lock().unwrap();
+        assert_eq!(seen[0].context_tag.as_deref(), Some("[author:Søren— s:1] "));
     }
 }
