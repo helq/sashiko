@@ -254,6 +254,7 @@ pub struct FetchRequest {
     pub mr_number: Option<i64>,
 }
 
+#[allow(dead_code)]
 pub struct FetchAgent {
     repo_path: PathBuf,
     rx: mpsc::Receiver<FetchRequest>,
@@ -263,6 +264,7 @@ pub struct FetchAgent {
     gitlab_token: Option<String>,
 }
 
+#[allow(dead_code)]
 impl FetchAgent {
     pub fn new(
         repo_path: PathBuf,
@@ -366,83 +368,6 @@ impl FetchAgent {
                 info!(
                     "All commits present locally, skipping fetch for {}",
                     url_display
-                );
-            } else if let Some(url) = url_opt {
-                // Remote fetch logic
-                let remote_name = self.get_remote_name(&url);
-
-                // Check if repo is local (same as self.repo_path)
-                let is_local = {
-                    let url_path = PathBuf::from(&url);
-                    if let (Ok(canon_url), Ok(canon_repo)) = (
-                        std::fs::canonicalize(&url_path),
-                        std::fs::canonicalize(&self.repo_path),
-                    ) {
-                        canon_url == canon_repo
-                    } else {
-                        false
-                    }
-                };
-
-                if is_local {
-                    warn!(
-                        "Repository is local but commits are missing: {:?}. Cannot fetch.",
-                        missing_commits
-                    );
-                    // Do not continue here; let it fall through to Step 3 where it will fail individually
-                } else {
-                    if let Err(e) = self.ensure_remote(&remote_name, &url).await {
-                        let err_msg = redact_secret(&e.to_string());
-                        error!("Failed to ensure remote {}: {}", url_display, err_msg);
-                        for commit in &missing_commits {
-                            let _ = self
-                                .main_tx
-                                .send(Event::IngestionFailed {
-                                    article_id: commit.clone(),
-                                    error: format!(
-                                        "Failed to set up remote {}: {}",
-                                        url_display, err_msg
-                                    ),
-                                    source: MessageSource::GitFetch,
-                                })
-                                .await;
-                        }
-                        continue;
-                    }
-
-                    // 1. Try optimistic fetch (fetch specific commits)
-                    if let Err(e) = self.fetch_commits(&remote_name, &missing_commits).await {
-                        warn!(
-                            "Optimistic fetch failed for {}: {}. Falling back to full fetch.",
-                            url_display,
-                            redact_secret(&e.to_string())
-                        );
-                        // 2. Fallback: Fetch everything (heads)
-                        if let Err(e) = self.fetch_all(&remote_name).await {
-                            let err_msg = redact_secret(&e.to_string());
-                            error!("Full fetch failed for {}: {}", url_display, err_msg);
-                            for commit in &missing_commits {
-                                let _ = self
-                                    .main_tx
-                                    .send(Event::IngestionFailed {
-                                        article_id: commit.clone(),
-                                        error: format!(
-                                            "Failed to fetch from {}: {}",
-                                            url_display, err_msg
-                                        ),
-                                        source: MessageSource::GitFetch,
-                                    })
-                                    .await;
-                            }
-                            continue;
-                        }
-                    }
-                }
-            } else {
-                // Local repo, but commits are missing
-                warn!(
-                    "Local repository missing commits: {:?}. Cannot fetch.",
-                    missing_commits
                 );
             }
         }
@@ -900,63 +825,6 @@ mod tests {
             agent.is_present(&commit_sha).await,
             "Commit SHA should be considered present"
         );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_process_queue_redacts_credentials_on_failure() -> Result<()> {
-        let temp_dir = tempfile::tempdir()?;
-        let repo_path = temp_dir.path().to_path_buf();
-
-        crate::git_cmd::in_dir_async(&repo_path)
-            .arg("init")
-            .output()
-            .await?;
-
-        let (tx, mut rx) = mpsc::channel(10);
-        let (agent, _) = FetchAgent::new(repo_path, tx, None);
-
-        let req = FetchRequest {
-            repo_url: Some("https://oauth2:glpat_secret123@127.0.0.1:0/group/repo.git".to_string()),
-            commit_hash: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string(),
-            mr_url: None,
-            mr_title: None,
-            mr_number: None,
-        };
-
-        let mut queue: HashMap<Option<String>, HashSet<String>> = HashMap::new();
-        queue
-            .entry(req.repo_url)
-            .or_default()
-            .insert(req.commit_hash.clone());
-
-        agent.process_queue(&mut queue).await;
-
-        let event = rx
-            .try_recv()
-            .expect("Expected IngestionFailed event to be emitted");
-        match event {
-            Event::IngestionFailed {
-                article_id,
-                error,
-                source,
-            } => {
-                assert_eq!(article_id, req.commit_hash);
-                assert_eq!(source, MessageSource::GitFetch);
-                assert!(
-                    error.contains("[REDACTED]"),
-                    "Expected error to contain [REDACTED], got: {}",
-                    error
-                );
-                assert!(
-                    !error.contains("glpat_secret123"),
-                    "Error leaked credential: {}",
-                    error
-                );
-            }
-            other => panic!("Expected IngestionFailed, got {:?}", other),
-        }
 
         Ok(())
     }
