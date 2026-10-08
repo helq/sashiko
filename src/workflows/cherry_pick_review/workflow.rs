@@ -27,10 +27,10 @@ use serde_json::{Value, json};
 
 use crate::ai::AiProvider;
 use crate::toolbox::ToolBox;
-use crate::worker::prompts::PromptRegistry;
+use crate::worker::{PromptRegistry, WorkerProgressEvent};
 use crate::workflow::{
     ExecutableStage, OutputFormat, ParallelPolicy, PromptTemplate, RecitationPolicy, Stage,
-    StagePolicy, ToolScope, Workflow,
+    StagePolicy, ToolScope, Workflow, WorkflowEvent,
 };
 use crate::workflows::linux_patch_review;
 
@@ -472,13 +472,58 @@ async fn git_show(worktree: &Path, sha: &str) -> Option<String> {
     git_output(worktree, &["show", "--end-of-options", sha]).await
 }
 
-#[allow(dead_code)]
 fn map_stage_name(name: &str) -> Option<String> {
     match name {
         "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "10" | "11" | "12" => {
             Some(name.to_string())
         }
         _ => None,
+    }
+}
+
+#[allow(dead_code)]
+fn handle_workflow_progress(
+    event: WorkflowEvent,
+    progress: Option<&(dyn Fn(WorkerProgressEvent) + Send + Sync)>,
+) {
+    let Some(cb) = progress else { return };
+    match event {
+        WorkflowEvent::StageStarted { stage_name } => {
+            if stage_name == "planning" {
+                cb(WorkerProgressEvent::PlanningStarted);
+            } else if let Some(stage) = map_stage_name(stage_name) {
+                cb(WorkerProgressEvent::StageStarted { stage });
+            }
+        }
+        WorkflowEvent::ParallelResolved { stage_names } => {
+            let mut planned_stages: Vec<String> =
+                stage_names.iter().map(|s| s.to_string()).collect();
+            if !planned_stages.is_empty() {
+                for s in ["8", "9", "10", "11", "12"] {
+                    planned_stages.push(s.to_string());
+                }
+            }
+            cb(WorkerProgressEvent::ReviewStarted { planned_stages });
+        }
+        WorkflowEvent::StageTurn {
+            stage_name,
+            turn,
+            max_turns,
+        } => {
+            if let Some(stage) = map_stage_name(stage_name) {
+                cb(WorkerProgressEvent::StageTurn {
+                    stage,
+                    turn,
+                    max_turns,
+                });
+            }
+        }
+        WorkflowEvent::StageFinished { stage_name, .. } => {
+            if let Some(stage) = map_stage_name(stage_name) {
+                cb(WorkerProgressEvent::StageFinished { stage });
+            }
+        }
+        _ => {}
     }
 }
 
