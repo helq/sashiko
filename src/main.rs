@@ -790,6 +790,45 @@ async fn run_daemon(
         fetch_agent.run().await;
     });
 
+    // Recover fetches orphaned before the durable queue existed or by a crash:
+    // re-enqueue any patchset stuck in 'Fetching' with no active queue row.
+    let mut seen_placeholder_ids = std::collections::HashSet::new();
+    loop {
+        match db.get_stuck_fetch_placeholders().await {
+            Ok(stuck) => {
+                if stuck.is_empty() {
+                    break;
+                }
+                let new_count = stuck
+                    .iter()
+                    .filter(|p| !seen_placeholder_ids.contains(&p.patchset_id))
+                    .count();
+                if new_count == 0 {
+                    error!(
+                        "Stuck fetch recovery made no forward progress on {} placeholder(s); aborting backfill loop to prevent startup hang",
+                        stuck.len()
+                    );
+                    break;
+                }
+                info!(
+                    "Backfilling {} orphaned fetch(es) into fetch_queue",
+                    stuck.len()
+                );
+                let count = stuck.len();
+                for p in stuck {
+                    seen_placeholder_ids.insert(p.patchset_id);
+                }
+                if count < 100 {
+                    break;
+                }
+            }
+            Err(e) => {
+                error!("Failed to query stuck fetch placeholders: {}", e);
+                break;
+            }
+        }
+    }
+
     // Parser Dispatcher
     let semaphore = Arc::new(Semaphore::new(50));
 
