@@ -15,5 +15,6 @@
 //! Cherry-pick review: finding filter.
 
 pub mod filter;
+pub mod prompts;
 
 pub use filter::filter_cherry_pick_findings;
