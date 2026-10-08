@@ -1371,6 +1371,56 @@ pub struct ForgeOutboxRow {
 
 #[cfg(feature = "server")]
 impl Database {
+    pub async fn get_review_context(&self, patchset_id: i64) -> Result<Option<String>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT review_context FROM patchsets WHERE id = ?",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        if let Some(row) = rows.next().await? {
+            let context: Option<String> = row.get(0)?;
+            Ok(context)
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn set_review_context(&self, patchset_id: i64, context: &str) -> Result<()> {
+        self.execute(
+            "UPDATE patchsets SET review_context = ? WHERE id = ?",
+            libsql::params![context, patchset_id],
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn table_exists(&self, table: &str) -> Result<bool> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                libsql::params![table],
+            )
+            .await?;
+        Ok(rows.next().await?.is_some())
+    }
+
+    pub async fn has_column(&self, table: &str, column: &str) -> Result<bool> {
+        let mut rows = self
+            .conn
+            .query(&format!("PRAGMA table_info({})", table), ())
+            .await?;
+        while let Some(row) = rows.next().await? {
+            let name: String = row.get(1)?;
+            if name == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn has_bug_actor(&self) -> bool {
         self.bug_actor != "system" || self.bug_tool != "sashiko"
     }
@@ -2057,7 +2107,20 @@ impl Database {
             tx.commit().await?;
         }
 
-        info!("Database schema is up to date at version 13.");
+        if current_version < 14 {
+            info!("Applying database migration version 14 (review context)...");
+            let tx = self.begin_transaction().await?;
+            if self.table_exists("patchsets").await?
+                && !self.has_column("patchsets", "review_context").await?
+            {
+                tx.execute_batch(include_str!("migrations/013_review_context.sql"))
+                    .await?;
+            }
+            tx.execute("PRAGMA user_version = 14", ()).await?;
+            tx.commit().await?;
+        }
+
+        info!("Database schema is up to date at version 14.");
 
         Ok(())
     }
@@ -22789,5 +22852,28 @@ mod tests {
                 "unexpected uncompressed text row > 1024 bytes in {table}.{col}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_review_context_migration_and_crud() {
+        let db = setup_db().await;
+        let thread_id = db.create_thread("msg-1", "Subject", 1000).await.unwrap();
+        let patchset_id = db
+            .create_patchset(
+                thread_id, None, "msg-1", "Subject", "Author", 1000, 1, 1, "to", "cc", None, 1,
+                None, true, None, None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let initial = db.get_review_context(patchset_id).await.unwrap();
+        assert_eq!(initial, None);
+
+        let context = r#"{"type":"cherry-pick","original_sha":"abcdef123456"}"#;
+        db.set_review_context(patchset_id, context).await.unwrap();
+
+        let updated = db.get_review_context(patchset_id).await.unwrap();
+        assert_eq!(updated.as_deref(), Some(context));
     }
 }
