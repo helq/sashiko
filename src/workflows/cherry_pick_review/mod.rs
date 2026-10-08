@@ -16,6 +16,7 @@
 
 pub mod filter;
 pub mod prompts;
+pub mod synthesis;
 pub mod workflow;
 
 pub use filter::filter_cherry_pick_findings;
