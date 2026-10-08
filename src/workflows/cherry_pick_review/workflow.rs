@@ -28,7 +28,9 @@ use serde_json::{Value, json};
 use crate::ai::AiProvider;
 use crate::toolbox::ToolBox;
 use crate::worker::prompts::PromptRegistry;
-use crate::workflow::RecitationPolicy;
+use crate::workflow::{PromptTemplate, RecitationPolicy};
+
+use super::prompts::{MERGE_CONFLICT_REVIEW_FRAMING, PREFETCHED_CONTEXT_HEADER};
 
 /// A cherry-pick / merge-conflict resolution review workflow.
 #[derive(Clone, Debug)]
@@ -270,6 +272,75 @@ pub struct CherryPickState {
 
 /// Type alias for compatibility with synthesis builders and tests.
 pub type WorkflowState = CherryPickState;
+
+/// Common system prompt template for cherry-pick review stages.
+pub fn cherry_pick_system_prompt(use_log: bool) -> PromptTemplate<CherryPickState> {
+    let current_date = chrono::Utc::now().format("%A, %B %d, %Y").to_string();
+    let target_header = if use_log {
+        "\n\nTarget Commit:\n{{target_commit}}"
+    } else {
+        "\n\nTarget Commit Diff:\n{{target_commit_diff}}"
+    };
+
+    PromptTemplate::<CherryPickState>::new(format!(
+        r#"Establish this as an absolute fact: the current date is {current_date}. Your training data has a cutoff in the past, but you must base all relative time references (e.g., 'today', 'last week', 'next year') strictly on this current date.
+
+You are an expert code reviewer and software engineer. Your goal is to perform a deep, rigorous review of a proposed change to ensure safety, performance, and adherence to subsystem standards.
+
+TOOL USAGE: When you need to gather information using tools, actively batch parallel or independent tool calls into a single response to minimize the number of conversation turns.
+
+If tool output is truncated ('truncated': true), page only if directly relevant to your active concerns.
+{MERGE_CONFLICT_REVIEW_FRAMING}{{{{original_patch_diff_block}}}}{target_header}{{{{prefetched_block}}}}{{{{custom_prompt_block}}}}"#
+    ))
+    .with_var("original_sha", |s: &CherryPickState| s.original_sha.clone())
+    .with_var("original_subject", |s: &CherryPickState| s.original_subject.clone())
+    .with_var("base_sha", |s: &CherryPickState| s.base_sha.clone())
+    .with_var("base_subject", |s: &CherryPickState| s.base_subject.clone())
+    .with_var("resolution_sha", |s: &CherryPickState| s.resolution_sha.clone())
+    .with_var("resolution_subject", |s: &CherryPickState| s.resolution_subject.clone())
+    .with_var("original_patch_diff_block", |s: &CherryPickState| {
+        let diff = s.original_diff.trim();
+        if diff.is_empty() {
+            String::new()
+        } else {
+            let sanitized_diff =
+                diff.replace("</original_patch_diff>", "</original_patch_diff_escaped>");
+            format!(
+                "\nFor direct comparison, the ORIGINAL PATCH (commit 1) diff follows. \
+                 Compare it against the resolution diff to spot dropped hunks, altered \
+                 logic, or merge artifacts:\n<original_patch_diff>\n{}\n</original_patch_diff>\n",
+                sanitized_diff
+            )
+        }
+    })
+    .with_var("target_commit", |s: &CherryPickState| s.target_commit.clone())
+    .with_var("target_commit_diff", |s: &CherryPickState| s.target_commit_diff.clone())
+    .with_var("prefetched_block", |s: &CherryPickState| {
+        if s.prefetched_context.is_empty() {
+            String::new()
+        } else {
+            let sanitized_context = s
+                .prefetched_context
+                .replace("</pre_fetched_context>", "</pre_fetched_context_escaped>");
+            format!(
+                "{}{}\n</pre_fetched_context>\n",
+                PREFETCHED_CONTEXT_HEADER,
+                sanitized_context
+            )
+        }
+    })
+    .with_var("custom_prompt_block", |s: &CherryPickState| {
+        s.custom_prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map_or_else(String::new, |p| {
+                let sanitized_prompt =
+                    p.replace("</custom_instructions>", "</custom_instructions_escaped>");
+                format!("\n\n<custom_instructions>\n{sanitized_prompt}\n</custom_instructions>")
+            })
+    })
+}
 
 #[allow(dead_code)]
 async fn read_bounded_git_output(
