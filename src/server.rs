@@ -3177,6 +3177,15 @@ mod tests {
         assert!(id.ends_with("@sashiko.local"));
     }
 
+    #[test]
+    fn test_is_valid_git_ref() {
+        assert!(!is_valid_git_ref(""));
+        assert!(!is_valid_git_ref("-upload-pack=sh"));
+        assert!(!is_valid_git_ref("--output=/tmp/x"));
+        assert!(is_valid_git_ref("abc1234"));
+        assert!(is_valid_git_ref("v1.0~1"));
+    }
+
     #[tokio::test]
     async fn test_api_token_endpoint_minting_and_attenuation() {
         let db_settings = crate::settings::DatabaseSettings {
@@ -3490,6 +3499,386 @@ mod tests {
             !bug_action.is_success(),
             "token reached a bug route: {}",
             bug_action
+        );
+    }
+
+    #[tokio::test]
+    async fn test_submit_cherry_pick_validation() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Arc::new(Database::new(&db_settings).await.unwrap());
+        db.migrate().await.unwrap();
+
+        let mut settings = crate::settings::Settings::new().unwrap();
+        settings.server.testing_mode = false;
+        let settings = Arc::new(settings);
+
+        let local_token = crate::auth::LocalToken::generate().unwrap();
+        let (event_tx, _event_rx) = mpsc::channel(10);
+        let (fetch_tx, mut fetch_rx) = mpsc::channel(10);
+        let app = build_router(
+            settings,
+            db.clone(),
+            event_tx,
+            fetch_tx,
+            ServerOptions {
+                local_token: Some(local_token.clone()),
+                ..Default::default()
+            },
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let submit = format!("http://{}/api/submit", addr);
+
+        // Invalid: contains ".."
+        // Invalid: cyclical internal SHA
+        let resp = client
+            .post(&submit)
+            .bearer_auth(local_token.secret())
+            .json(&serde_json::json!({
+                "type": "cherry-pick",
+                "sha": "1234567890abcdef1234567890abcdef12345678",
+                "original_sha": "1234567890abcdef1234567890abcdef12345678",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Invalid: cyclical base SHA
+        let resp = client
+            .post(&submit)
+            .bearer_auth(local_token.secret())
+            .json(&serde_json::json!({
+                "type": "cherry-pick",
+                "sha": "1234567890abcdef1234567890abcdef12345678",
+                "original_sha": "abcdef1234567890abcdef1234567890abcdef12",
+                "base_sha": "1234567890abcdef1234567890abcdef12345678",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let resp = client
+            .post(&submit)
+            .bearer_auth(local_token.secret())
+            .json(&serde_json::json!({
+                "type": "cherry-pick",
+                "sha": "abc..def",
+                "original_sha": "1234567890abcdef1234567890abcdef12345678",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Invalid: original_sha contains ".."
+        let resp = client
+            .post(&submit)
+            .bearer_auth(local_token.secret())
+            .json(&serde_json::json!({
+                "type": "cherry-pick",
+                "sha": "1234567890abcdef1234567890abcdef12345678",
+                "original_sha": "orig..parent",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Invalid: git ref starting with '-'
+        let resp = client
+            .post(&submit)
+            .bearer_auth(local_token.secret())
+            .json(&serde_json::json!({
+                "type": "cherry-pick",
+                "sha": "-invalid-ref",
+                "original_sha": "1234567890abcdef1234567890abcdef12345678",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Valid new cherry-pick request
+        let resp = client
+            .post(&submit)
+            .bearer_auth(local_token.secret())
+            .json(&serde_json::json!({
+                "type": "cherry-pick",
+                "sha": "res1234567890abcdef1234567890abcdef12345678",
+                "original_sha": "orig1234567890abcdef1234567890abcdef12345678",
+                "base_sha": "base1234567890abcdef1234567890abcdef12345678",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], "accepted");
+        assert_eq!(body["id"], "res1234567890abcdef1234567890abcdef12345678");
+
+        let fetch_req = fetch_rx.recv().await.unwrap();
+        assert_eq!(
+            fetch_req.commit_hash,
+            "res1234567890abcdef1234567890abcdef12345678"
+        );
+        assert_eq!(
+            fetch_req.supporting_commits,
+            vec![
+                "orig1234567890abcdef1234567890abcdef12345678".to_string(),
+                "base1234567890abcdef1234567890abcdef12345678".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_submit_cherry_pick_multi_patch_rejection_and_singleton() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Arc::new(Database::new(&db_settings).await.unwrap());
+        db.migrate().await.unwrap();
+
+        // 1. Create a multi-patch series in DB
+        let thread_id = db
+            .create_thread("multi-thread", "Multi Series", 1000)
+            .await
+            .unwrap();
+        let multi_sha = "multi1234567890abcdef1234567890abcdef12345678";
+        db.create_message(
+            multi_sha, thread_id, None, "Author", "Multi 1", 1000, "", "", "", None, None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            "multi-sha-2",
+            thread_id,
+            None,
+            "Author",
+            "Multi 2",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let multi_ps_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                multi_sha,
+                "Multi Series",
+                "Author",
+                1000,
+                2,
+                1,
+                "to",
+                "cc",
+                Some(1),
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_patch(multi_ps_id, multi_sha, 1, "diff1")
+            .await
+            .unwrap();
+        db.create_patch(multi_ps_id, "multi-sha-2", 2, "diff2")
+            .await
+            .unwrap();
+
+        // 2. Create a singleton in DB
+        let thread_id2 = db
+            .create_thread("single-thread", "Single Patch", 1000)
+            .await
+            .unwrap();
+        let single_sha = "single1234567890abcdef1234567890abcdef12345678";
+        db.create_message(
+            single_sha, thread_id2, None, "Author", "Single 1", 1000, "", "", "", None, None,
+        )
+        .await
+        .unwrap();
+        let single_ps_id = db
+            .create_patchset(
+                thread_id2,
+                None,
+                single_sha,
+                "Single Patch",
+                "Author",
+                1000,
+                1,
+                1,
+                "to",
+                "cc",
+                Some(1),
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_patch(single_ps_id, single_sha, 1, "diff_single")
+            .await
+            .unwrap();
+
+        let mut settings = crate::settings::Settings::new().unwrap();
+        settings.server.testing_mode = false;
+        let jwt_secret = "test-jwt-secret-key-12345678901234567890";
+        settings.server.jwt_secret = Some(jwt_secret.to_string());
+        settings.server.acl.ingest = vec![
+            "ingest-only@example.org".to_string(),
+            "reviewer@example.org".to_string(),
+        ];
+        settings.server.acl.review = vec!["reviewer@example.org".to_string()];
+        let settings = Arc::new(settings);
+
+        let local_token = crate::auth::LocalToken::generate().unwrap();
+        let (event_tx, _event_rx) = mpsc::channel(10);
+        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
+        let app = build_router(
+            settings,
+            db.clone(),
+            event_tx,
+            fetch_tx,
+            ServerOptions {
+                allow_all_submit: false,
+                local_token: Some(local_token.clone()),
+                ..Default::default()
+            },
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let submit = format!("http://{}/api/submit", addr);
+
+        // Attempting cherry-pick on multi-patch series must be rejected
+        let resp = client
+            .post(&submit)
+            .bearer_auth(local_token.secret())
+            .json(&serde_json::json!({
+                "type": "cherry-pick",
+                "sha": multi_sha,
+                "original_sha": "orig1234567890abcdef1234567890abcdef12345678",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Caller with only Ingest permission cannot rerun cherry-pick on already ingested patchset
+        let ingest_token = crate::auth::create_token(
+            "ingest-only@example.org",
+            jwt_secret,
+            Some("session".to_string()),
+            3600,
+        )
+        .unwrap();
+        let resp = client
+            .post(&submit)
+            .bearer_auth(&ingest_token)
+            .json(&serde_json::json!({
+                "type": "cherry-pick",
+                "sha": single_sha,
+                "original_sha": "orig1234567890abcdef1234567890abcdef12345678",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // Setting status to 'In Review' causes cherry-pick rerun to return CONFLICT
+        db.update_patchset_status(single_ps_id, "In Review")
+            .await
+            .unwrap();
+        let resp = client
+            .post(&submit)
+            .bearer_auth(local_token.secret())
+            .json(&serde_json::json!({
+                "type": "cherry-pick",
+                "sha": single_sha,
+                "original_sha": "orig1234567890abcdef1234567890abcdef12345678",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        // Reset status back to Pending and verify rerun succeeds with reviewer credentials
+        db.update_patchset_status(single_ps_id, "Pending")
+            .await
+            .unwrap();
+        let reviewer_token = crate::auth::create_token(
+            "reviewer@example.org",
+            jwt_secret,
+            Some("session".to_string()),
+            3600,
+        )
+        .unwrap();
+        let resp = client
+            .post(&submit)
+            .bearer_auth(&reviewer_token)
+            .json(&serde_json::json!({
+                "type": "cherry-pick",
+                "sha": single_sha,
+                "original_sha": "orig1234567890abcdef1234567890abcdef12345678",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let status = db.get_patchset_status(single_ps_id).await.unwrap();
+        assert_eq!(status.as_deref(), Some("Fetching"));
+
+        let ctx_json = db.get_review_context(single_ps_id).await.unwrap();
+        assert!(ctx_json.is_some());
+        assert!(
+            ctx_json
+                .unwrap()
+                .contains("orig1234567890abcdef1234567890abcdef12345678")
+        );
+        assert_eq!(
+            db.get_patchset_status(single_ps_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("Fetching")
         );
     }
 
