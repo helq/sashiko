@@ -846,6 +846,7 @@ fn build_analysis_stage(
         .tools(ToolScope::All)
         .max_turns(max_turns)
         .temperature(temperature)
+        .context_tag_suffix(format!("s:{num}"))
         .on_recitation(recitation_reminder())
         .reduce(move |state: &mut CherryPickState, val: Value| {
             if let Some(arr) = val.get("concerns").and_then(|v| v.as_array()) {
@@ -994,6 +995,7 @@ fn build_stage8(max_turns: usize, temperature: f32) -> Stage<CherryPickState, Va
         .tools(ToolScope::All)
         .max_turns(max_turns)
         .temperature(temperature)
+        .context_tag_suffix("s:8")
         .on_recitation(recitation_reminder())
         .reduce(|state: &mut CherryPickState, val: Value| {
             stage8_reduce(state, &val);
@@ -1018,6 +1020,7 @@ fn build_stage9(max_turns: usize, temperature: f32) -> Stage<CherryPickState, Va
         .tools(ToolScope::All)
         .max_turns(max_turns)
         .temperature(temperature)
+        .context_tag_suffix("s:9")
         .on_recitation(recitation_reminder())
         .reduce(|state: &mut CherryPickState, val: Value| {
             stage9_reduce(state, &val);
@@ -1122,6 +1125,7 @@ fn build_stage10(max_turns: usize, temperature: f32) -> Stage<CherryPickState, V
         .tools(ToolScope::All)
         .max_turns(max_turns)
         .temperature(temperature)
+        .context_tag_suffix("s:10")
         .on_recitation(recitation_reminder())
         .reduce(|state: &mut CherryPickState, val: Value| {
             state.findings = Some(val.get("findings").cloned().unwrap_or(val));
@@ -1145,6 +1149,7 @@ fn build_stage_origin(max_turns: usize, temperature: f32) -> Stage<CherryPickSta
         .tools(ToolScope::All)
         .max_turns(max_turns)
         .temperature(temperature)
+        .context_tag_suffix("s:11")
         .on_recitation(recitation_reminder())
         .on_validation_exhausted(|_state: &mut CherryPickState| {
             tracing::warn!("Origin classification validation exhausted; keeping Stage 10 findings with default origin.");
@@ -1226,6 +1231,7 @@ fn build_stage12(max_turns: usize, temperature: f32) -> Stage<CherryPickState, S
         .tools(ToolScope::All)
         .max_turns(max_turns)
         .temperature(temperature)
+        .context_tag_suffix("s:12")
         .on_recitation(RecitationPolicy::FallbackToFreeForm {
             reminder: "\n\nCRITICAL: The previous attempt failed due to a RECITATION policy violation. Keep the required 'commit <hash>' and 'Author:' headers and use '>' only for short single-line location anchors (such as the file path or function signature), but do NOT quote multi-line code hunks verbatim from the patch. Start your report with a note explaining that the format is altered due to recitation restrictions, and paraphrase the findings in your own words.".to_string(),
         })
@@ -1430,10 +1436,10 @@ mod tests {
         assert_eq!(result.tokens_out, 25);
 
         // Verify planning request had system configured and context_tag = None,
-        // while stage 1 had context_tag "[ps:1 p:1] "
+        // while stage 1 had context_tag "[ps:1 p:1 s:1] "
         let reqs = provider.requests.lock().unwrap();
         assert!(reqs[0].system.is_some());
-        assert_eq!(reqs[1].context_tag.as_deref(), Some("[ps:1 p:1] "));
+        assert_eq!(reqs[1].context_tag.as_deref(), Some("[ps:1 p:1 s:1] "));
     }
 
     #[tokio::test]
