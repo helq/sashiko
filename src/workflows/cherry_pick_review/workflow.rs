@@ -34,9 +34,11 @@ use crate::workflow::{
 use crate::workflows::linux_patch_review;
 
 use super::prompts::{
-    ANALYSIS_FORMAT_GUIDANCE, DROPPED_CHANGES, MERGE_CONFLICT_REVIEW_FRAMING, MERGE_CORRECTNESS,
-    PLANNING, PREFETCHED_CONTEXT_HEADER, SEMANTIC_INTENT,
+    ANALYSIS_FORMAT_GUIDANCE, CHERRY_PICK_CONFLICT_RESOLUTION_INSTRUCTION,
+    CHERRY_PICK_DEDUPLICATION_INSTRUCTION, DROPPED_CHANGES, MERGE_CONFLICT_REVIEW_FRAMING,
+    MERGE_CORRECTNESS, PLANNING, PREFETCHED_CONTEXT_HEADER, SEMANTIC_INTENT,
 };
+use super::synthesis;
 
 /// A cherry-pick / merge-conflict resolution review workflow.
 #[derive(Clone, Debug)]
@@ -745,6 +747,69 @@ fn format_stage1_to_7_feedback(violation: &str) -> String {
 }
 
 #[allow(dead_code)]
+fn build_stage8(max_turns: usize, temperature: f32) -> Stage<CherryPickState, Value> {
+    Stage::builder("8")
+        .system_prompt(cherry_pick_system_prompt(true))
+        .user_prompt(PromptTemplate::new("{{user}}").with_var(
+            "user",
+            move |s: &CherryPickState| {
+                (synthesis::stage8_builder())(CHERRY_PICK_DEDUPLICATION_INSTRUCTION, s).0
+            },
+        ))
+        .output_format(
+            OutputFormat::json()
+                .with_validator(validate_stage8)
+                .with_feedback_formatter(format_stage8_feedback),
+        )
+        .tools(ToolScope::All)
+        .max_turns(max_turns)
+        .temperature(temperature)
+        .on_recitation(recitation_reminder())
+        .reduce(|state: &mut CherryPickState, val: Value| {
+            if let Some(arr) = val.get("concerns").and_then(|v| v.as_array()) {
+                state.concerns = arr.clone();
+            }
+            if let Some(arr) = val.get("dismissed_concerns").and_then(|v| v.as_array()) {
+                state.dismissed_concerns = arr.clone();
+            }
+        })
+        .build()
+}
+
+#[allow(dead_code)]
+fn build_stage9(max_turns: usize, temperature: f32) -> Stage<CherryPickState, Value> {
+    Stage::builder("9")
+        .system_prompt(cherry_pick_system_prompt(true))
+        .user_prompt(PromptTemplate::new("{{user}}").with_var(
+            "user",
+            move |s: &CherryPickState| {
+                (synthesis::stage9_builder())(CHERRY_PICK_CONFLICT_RESOLUTION_INSTRUCTION, s).0
+            },
+        ))
+        .output_format(
+            OutputFormat::json()
+                .with_validator(validate_stage9)
+                .with_feedback_formatter(format_stage9_feedback),
+        )
+        .tools(ToolScope::All)
+        .max_turns(max_turns)
+        .temperature(temperature)
+        .on_recitation(recitation_reminder())
+        .reduce(|state: &mut CherryPickState, val: Value| {
+            if let Some(arr) = val.get("concerns").and_then(|v| v.as_array()) {
+                state.concerns = arr.clone();
+            }
+            if let Some(arr) = val.get("dismissed_concerns").and_then(|v| v.as_array()) {
+                for item in arr {
+                    if !state.dismissed_concerns.contains(item) {
+                        state.dismissed_concerns.push(item.clone());
+                    }
+                }
+            }
+        })
+        .build()
+}
+
 fn validate_stage8(val: &Value, _state: &CherryPickState) -> Result<(), String> {
     if let Some(c) = val.get("concerns") {
         if let Some(arr) = c.as_array() {
@@ -777,7 +842,6 @@ fn validate_stage8(val: &Value, _state: &CherryPickState) -> Result<(), String> 
     Ok(())
 }
 
-#[allow(dead_code)]
 fn format_stage8_feedback(violation: &str) -> String {
     format!(
         "\n\nPrevious attempt was rejected: {}. You MUST return ONLY a JSON object containing 'concerns' and 'dismissed_concerns' arrays. If there are no concerns and no dismissed concerns, return `{{\"concerns\": [], \"dismissed_concerns\": []}}`.",
@@ -785,7 +849,6 @@ fn format_stage8_feedback(violation: &str) -> String {
     )
 }
 
-#[allow(dead_code)]
 fn validate_stage9(val: &Value, _state: &CherryPickState) -> Result<(), String> {
     if let Some(c) = val.get("concerns") {
         if let Some(arr) = c.as_array() {
@@ -816,7 +879,6 @@ fn validate_stage9(val: &Value, _state: &CherryPickState) -> Result<(), String> 
     Ok(())
 }
 
-#[allow(dead_code)]
 fn format_stage9_feedback(violation: &str) -> String {
     format!(
         "\n\nPrevious attempt was rejected: {}. You MUST return ONLY a JSON object containing 'concerns' and optional 'dismissed_concerns' arrays. If there are no remaining concerns, return `{{\"concerns\": [], \"dismissed_concerns\": []}}`.",
