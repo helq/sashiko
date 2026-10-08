@@ -29,8 +29,12 @@ use crate::ai::AiProvider;
 use crate::toolbox::ToolBox;
 use crate::worker::prompts::PromptRegistry;
 use crate::workflow::{PromptTemplate, RecitationPolicy};
+use crate::workflows::linux_patch_review;
 
-use super::prompts::{MERGE_CONFLICT_REVIEW_FRAMING, PREFETCHED_CONTEXT_HEADER};
+use super::prompts::{
+    DROPPED_CHANGES, MERGE_CONFLICT_REVIEW_FRAMING, MERGE_CORRECTNESS, PREFETCHED_CONTEXT_HEADER,
+    SEMANTIC_INTENT,
+};
 
 /// A cherry-pick / merge-conflict resolution review workflow.
 #[derive(Clone, Debug)]
@@ -457,6 +461,47 @@ async fn git_subject(worktree: &Path, sha: &str) -> Option<String> {
 
 async fn git_show(worktree: &Path, sha: &str) -> Option<String> {
     git_output(worktree, &["show", "--end-of-options", sha]).await
+}
+
+#[allow(dead_code)]
+fn analysis_stage_spec(num: u8) -> (&'static str, &'static str, &'static [&'static str], bool) {
+    let name: &'static str = match num {
+        1 => "1",
+        2 => "2",
+        3 => "3",
+        4 => "4",
+        5 => "5",
+        6 => "6",
+        7 => "7",
+        _ => unreachable!("invalid stage number: {}", num),
+    };
+    let (instruction, guides, use_log): (&'static str, &'static [&'static str], bool) = match num {
+        1 => (SEMANTIC_INTENT, &[], true),
+        2 => (DROPPED_CHANGES, &[], true),
+        3 => (MERGE_CORRECTNESS, &[], false),
+        4 => {
+            let stage = linux_patch_review::analysis_stage_by_name("resources")
+                .expect("registered linux_patch_review stage definition must exist");
+            (stage.instruction, stage.guides, stage.uses_commit_log)
+        }
+        5 => {
+            let stage = linux_patch_review::analysis_stage_by_name("locking")
+                .expect("registered linux_patch_review stage definition must exist");
+            (stage.instruction, stage.guides, stage.uses_commit_log)
+        }
+        6 => {
+            let stage = linux_patch_review::analysis_stage_by_name("security")
+                .expect("registered linux_patch_review stage definition must exist");
+            (stage.instruction, stage.guides, stage.uses_commit_log)
+        }
+        7 => {
+            let stage = linux_patch_review::analysis_stage_by_name("hardware")
+                .expect("registered linux_patch_review stage definition must exist");
+            (stage.instruction, stage.guides, stage.uses_commit_log)
+        }
+        _ => unreachable!("invalid analysis stage number: {}", num),
+    };
+    (name, instruction, guides, use_log)
 }
 
 #[allow(dead_code)]
