@@ -29,9 +29,12 @@ use crate::ai::AiProvider;
 use crate::toolbox::ToolBox;
 use crate::worker::prompts::PromptRegistry;
 use crate::workflow::{
-    ExecutableStage, OutputFormat, PromptTemplate, RecitationPolicy, Stage, StagePolicy, ToolScope,
+    ExecutableStage, OutputFormat, ParallelPolicy, PromptTemplate, RecitationPolicy, Stage,
+    StagePolicy, ToolScope, Workflow,
 };
 use crate::workflows::linux_patch_review;
+
+use super::filter::filter_cherry_pick_findings;
 
 use super::prompts::{
     ANALYSIS_FORMAT_GUIDANCE, CHERRY_PICK_CONFLICT_RESOLUTION_INSTRUCTION,
@@ -272,6 +275,7 @@ pub struct CherryPickState {
     pub concerns: Vec<Value>,
     pub total_concerns: usize,
     pub dismissed_concerns: Vec<Value>,
+    pub preexisting_concerns: Vec<Value>,
     pub findings: Option<Value>,
     pub classified_findings: Option<Value>,
     pub review_inline: Option<String>,
@@ -469,6 +473,94 @@ async fn git_show(worktree: &Path, sha: &str) -> Option<String> {
 }
 
 #[allow(dead_code)]
+fn build_cherry_pick_workflow(max_turns: usize, temperature: f32) -> Workflow<CherryPickState> {
+    let planner = build_planning_stage();
+    let resolver = build_analysis_resolver(max_turns, temperature);
+    let stage8 = build_stage8(max_turns, temperature);
+    let stage9 = build_stage9(max_turns, temperature);
+    let stage10 = build_stage10(max_turns, temperature);
+    let stage_origin = build_stage_origin(max_turns, temperature);
+    let stage12 = build_stage12(max_turns, temperature);
+
+    Workflow::builder("cherry-pick")
+        .dynamic_parallel(planner, resolver, ParallelPolicy::BestEffort)
+        .early_exit_if(
+            |s: &CherryPickState| s.concerns.is_empty(),
+            "No concerns raised in analysis stages",
+        )
+        .stage(stage8)
+        .early_exit_if(
+            |s: &CherryPickState| s.concerns.is_empty(),
+            "No concerns remaining after deduplication",
+        )
+        .stage(stage9)
+        .early_exit_if(
+            |s: &CherryPickState| s.concerns.is_empty(),
+            "No concerns remaining after conflict resolution",
+        )
+        .stage(stage10)
+        .early_exit_if(findings_empty, "No findings remaining after verification")
+        .stage(stage_origin)
+        .step(|state: &mut CherryPickState| {
+            if let Some(f) = state.findings.take() {
+                state.classified_findings = Some(f.clone());
+                let items = f
+                    .get("findings")
+                    .and_then(|v| v.as_array())
+                    .or_else(|| f.as_array());
+                if let Some(items) = items {
+                    for item in items {
+                        let origin = item
+                            .get("origin")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("resolution_introduced")
+                            .to_lowercase();
+                        let severity = item
+                            .get("severity")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("medium")
+                            .to_lowercase();
+                        if origin == "base_preexisting" && severity != "low" {
+                            let problem = item
+                                .get("problem")
+                                .or_else(|| item.get("description"))
+                                .cloned()
+                                .unwrap_or_else(|| Value::String(String::new()));
+                            let explanation = item
+                                .get("severity_explanation")
+                                .or_else(|| item.get("explanation"))
+                                .or_else(|| item.get("reasoning"))
+                                .cloned()
+                                .unwrap_or_else(|| Value::String(String::new()));
+                            let locations = item
+                                .get("locations")
+                                .cloned()
+                                .unwrap_or_else(|| serde_json::json!([]));
+                            state.preexisting_concerns.push(serde_json::json!({
+                                "type": problem,
+                                "description": problem,
+                                "reasoning": explanation,
+                                "preexisting": true,
+                                "locations": locations,
+                            }));
+                        }
+                    }
+                }
+                let filtered = filter_cherry_pick_findings(&f);
+                if filtered.as_array().is_some_and(|a| a.is_empty()) {
+                    state.review_inline =
+                        Some("No issues found after conflict review filtering.".to_string());
+                }
+                state.findings = Some(filtered);
+            }
+        })
+        .early_exit_if(
+            findings_empty,
+            "No findings remaining after conflict review filtering",
+        )
+        .stage(stage12)
+        .build()
+}
 fn build_planning_stage() -> Stage<CherryPickState, Value> {
     Stage::builder("planning")
         .skip_if(|s: &CherryPickState| s.manual_stages.is_some())
@@ -537,7 +629,6 @@ fn build_planning_stage() -> Stage<CherryPickState, Value> {
         .build()
 }
 
-#[allow(dead_code)]
 fn build_analysis_resolver(
     max_turns: usize,
     temperature: f32,
@@ -747,7 +838,6 @@ fn format_stage1_to_7_feedback(violation: &str) -> String {
     )
 }
 
-#[allow(dead_code)]
 fn build_stage8(max_turns: usize, temperature: f32) -> Stage<CherryPickState, Value> {
     Stage::builder("8")
         .system_prompt(cherry_pick_system_prompt(true))
@@ -777,7 +867,6 @@ fn build_stage8(max_turns: usize, temperature: f32) -> Stage<CherryPickState, Va
         .build()
 }
 
-#[allow(dead_code)]
 fn build_stage9(max_turns: usize, temperature: f32) -> Stage<CherryPickState, Value> {
     Stage::builder("9")
         .system_prompt(cherry_pick_system_prompt(true))
@@ -887,7 +976,6 @@ fn format_stage9_feedback(violation: &str) -> String {
     )
 }
 
-#[allow(dead_code)]
 fn build_stage10(max_turns: usize, temperature: f32) -> Stage<CherryPickState, Value> {
     Stage::builder("10")
         .system_prompt(cherry_pick_system_prompt(true))
@@ -916,7 +1004,6 @@ fn build_stage10(max_turns: usize, temperature: f32) -> Stage<CherryPickState, V
         .build()
 }
 
-#[allow(dead_code)]
 fn build_stage_origin(max_turns: usize, temperature: f32) -> Stage<CherryPickState, Value> {
     Stage::builder("11")
         .system_prompt(cherry_pick_system_prompt(true))
@@ -997,7 +1084,6 @@ fn format_stage10_feedback(violation: &str) -> String {
     )
 }
 
-#[allow(dead_code)]
 fn build_stage12(max_turns: usize, temperature: f32) -> Stage<CherryPickState, String> {
     Stage::builder("12")
         .system_prompt(cherry_pick_system_prompt(true))
