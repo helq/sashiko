@@ -15,9 +15,8 @@ use std::sync::Arc;
 #[derive(Debug, serde::Deserialize)]
 struct FixtureConfig {
     name: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    description: String,
+    #[serde(default, rename = "description")]
+    _description: String,
     repo: RepoConfig,
     patchset: PatchsetConfig,
     #[serde(default)]

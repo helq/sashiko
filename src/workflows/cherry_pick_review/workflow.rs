@@ -408,7 +408,6 @@ pub async fn execute_workflow(
     })
 }
 
-#[allow(dead_code)]
 async fn read_bounded_git_output(
     mut child: tokio::process::Child,
     limit: usize,
@@ -776,7 +775,6 @@ fn build_analysis_resolver(
     }
 }
 
-#[allow(dead_code)]
 fn analysis_stage_spec(num: u8) -> (&'static str, &'static str, &'static [&'static str], bool) {
     let name: &'static str = match num {
         1 => "1",
@@ -817,7 +815,6 @@ fn analysis_stage_spec(num: u8) -> (&'static str, &'static str, &'static [&'stat
     (name, instruction, guides, use_log)
 }
 
-#[allow(dead_code)]
 fn build_analysis_stage(
     num: u8,
     max_turns: usize,
@@ -870,7 +867,6 @@ fn build_analysis_stage(
         .build()
 }
 
-#[allow(dead_code)]
 fn recitation_reminder() -> RecitationPolicy {
     RecitationPolicy::RetryWithReminder(
         "IMPORTANT: Your previous response was blocked by a recitation filter. \
@@ -882,7 +878,6 @@ fn recitation_reminder() -> RecitationPolicy {
     )
 }
 
-#[allow(dead_code)]
 fn tag_source(item: Value, stage: u8) -> Option<Value> {
     match item {
         Value::Object(mut map) => {
@@ -898,7 +893,6 @@ fn tag_source(item: Value, stage: u8) -> Option<Value> {
     }
 }
 
-#[allow(dead_code)]
 fn findings_empty(state: &CherryPickState) -> bool {
     state
         .findings
@@ -911,7 +905,6 @@ fn findings_empty(state: &CherryPickState) -> bool {
 // Stage Validators & Feedback Formatters
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
 fn validate_stages_1_to_7(val: &Value, _state: &CherryPickState) -> Result<(), String> {
     let concerns = val
         .get("concerns")
@@ -955,7 +948,6 @@ fn validate_stages_1_to_7(val: &Value, _state: &CherryPickState) -> Result<(), S
     Ok(())
 }
 
-#[allow(dead_code)]
 fn format_stage1_to_7_feedback(violation: &str) -> String {
     format!(
         "\n\nPrevious attempt was rejected: {}. You MUST return ONLY a JSON object containing 'concerns' and 'dismissed_concerns' arrays. If there are no concerns and no dismissed concerns, return `{{\"concerns\": [], \"dismissed_concerns\": []}}`.",
