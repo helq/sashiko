@@ -155,9 +155,9 @@ impl FetchAgent {
                     "All commits present locally, skipping fetch for {}",
                     url_display
                 );
-            } else if let Some(url) = url_opt {
+            } else if let Some(ref url) = url_opt {
                 // Remote fetch logic
-                let remote_name = self.get_remote_name(&url);
+                let remote_name = self.get_remote_name(url);
 
                 // Check if repo is local (same as self.repo_path)
                 let is_local = {
@@ -179,7 +179,7 @@ impl FetchAgent {
                     );
                     // Do not continue here; let it fall through to Step 3 where it will fail individually
                 } else {
-                    if let Err(e) = self.ensure_remote(&remote_name, &url).await {
+                    if let Err(e) = self.ensure_remote(&remote_name, url).await {
                         let err_msg = redact_secret(&e.to_string());
                         error!("Failed to ensure remote {}: {}", url_display, err_msg);
                         for commit in &missing_commits {
@@ -236,6 +236,13 @@ impl FetchAgent {
 
             // 3. Process each commit or range
             for commit_or_range in commit_list {
+                let supporting_commits = self.supporting_commits.get(&commit_or_range).cloned();
+                let (mr_url, mr_title, mr_number) = self
+                    .mr_metadata
+                    .get(&commit_or_range)
+                    .cloned()
+                    .unwrap_or((None, None, None));
+
                 if commit_or_range.contains("..") {
                     // It's a range
                     let range = &commit_or_range;
@@ -261,12 +268,6 @@ impl FetchAgent {
                     let count = shas.len() as u32;
 
                     // Process each SHA
-                    let (mr_url, mr_title, mr_number) = self
-                        .mr_metadata
-                        .get(range)
-                        .cloned()
-                        .unwrap_or((None, None, None));
-
                     let article_id = if let Some(number) = mr_number {
                         format!("mr-{}-{}", number, range)
                     } else {
@@ -328,11 +329,65 @@ impl FetchAgent {
                         }
                     };
 
-                    let (mr_url, mr_title, mr_number) = self
-                        .mr_metadata
-                        .get(&commit_or_range)
-                        .cloned()
-                        .unwrap_or((None, None, None));
+                    if let Some(supporting) = supporting_commits {
+                        let mut missing_sup = None;
+                        for sup in &supporting {
+                            if !self.is_present(sup).await
+                                && let Some(ref url) = url_opt
+                            {
+                                let remote_name = self.get_remote_name(url);
+                                match self.ensure_remote(&remote_name, url).await {
+                                    Ok(_) => {
+                                        if let Err(e) = self
+                                            .fetch_commits(&remote_name, std::slice::from_ref(sup))
+                                            .await
+                                        {
+                                            warn!(
+                                                "Optimistic fetch of supporting commit {} failed: {}. Falling back to full fetch.",
+                                                sup,
+                                                redact_secret(&e.to_string())
+                                            );
+                                            if let Err(e2) = self.fetch_all(&remote_name).await {
+                                                warn!(
+                                                    "Failed to fetch supporting commit {}: {}",
+                                                    sup,
+                                                    redact_secret(&e2.to_string())
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to ensure remote {} ({}): {}",
+                                            remote_name,
+                                            redact_secret(url),
+                                            redact_secret(&e.to_string())
+                                        );
+                                    }
+                                }
+                            }
+                            if !self.is_present(sup).await {
+                                missing_sup = Some(sup.clone());
+                                break;
+                            }
+                        }
+
+                        if let Some(sup) = missing_sup {
+                            error!("Missing supporting commit {} required for review", sup);
+                            let _ = self
+                                .main_tx
+                                .send(Event::IngestionFailed {
+                                    article_id: commit_or_range.clone(),
+                                    error: format!(
+                                        "Missing supporting commit {} required for review",
+                                        sup
+                                    ),
+                                    source: MessageSource::GitFetch,
+                                })
+                                .await;
+                            continue;
+                        }
+                    }
 
                     let article_id = if let Some(number) = mr_number {
                         format!("mr-{}-{}", number, commit_or_range)
@@ -834,6 +889,79 @@ mod tests {
             }
             other => panic!("Expected IngestionFailed, got {:?}", other),
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_missing_supporting_commit_fails_ingestion() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let repo_path = temp_dir.path().to_path_buf();
+
+        crate::git_cmd::in_dir_async(&repo_path)
+            .arg("init")
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(&repo_path)
+            .args(["config", "user.name", "Test User"])
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(&repo_path)
+            .args(["config", "user.email", "test@example.com"])
+            .output()
+            .await?;
+
+        let file_path = repo_path.join("file.txt");
+        let mut file = File::create(&file_path)?;
+        writeln!(file, "content")?;
+
+        crate::git_cmd::in_dir_async(&repo_path)
+            .args(["add", "."])
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(&repo_path)
+            .args(["commit", "-m", "Subject Line"])
+            .output()
+            .await?;
+
+        let output = crate::git_cmd::in_dir_async(&repo_path)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .await?;
+        let commit_sha = String::from_utf8(output.stdout)?.trim().to_string();
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let (mut agent, _sender) = FetchAgent::new(repo_path.clone(), tx, None);
+
+        let missing_sup = "0123456789012345678901234567890123456789".to_string();
+        let mut queue: HashMap<Option<String>, HashSet<String>> = HashMap::new();
+        queue.entry(None).or_default().insert(commit_sha.clone());
+        agent
+            .supporting_commits
+            .insert(commit_sha.clone(), vec![missing_sup.clone()]);
+
+        agent.process_queue(&mut queue).await;
+
+        let event = rx.recv().await.expect("expected an event");
+        match event {
+            Event::IngestionFailed {
+                article_id, error, ..
+            } => {
+                assert_eq!(article_id, commit_sha);
+                assert!(
+                    error.contains(&format!(
+                        "Missing supporting commit {} required for review",
+                        missing_sup
+                    )),
+                    "error message mismatch: {}",
+                    error
+                );
+            }
+            other => panic!("expected IngestionFailed, got {:?}", other),
+        }
+
+        // Verify that no PatchSubmitted event was sent
+        assert!(rx.try_recv().is_err());
 
         Ok(())
     }
