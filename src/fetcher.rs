@@ -347,52 +347,6 @@ impl FetchWorker {
         }))
     }
 
-    /// Decide whether to retry (with backoff) or terminally fail a fetch.
-    #[allow(dead_code)]
-    async fn handle_failure(&self, row: &FetchQueueRow, error: anyhow::Error) {
-        let now = now_secs();
-        let first = row.first_attempt_at.unwrap_or(now);
-        let permanent = error.chain().any(|e| e.is::<PermanentFetchError>());
-        let msg = format!("{:#}", error);
-        if permanent {
-            error!(
-                "Fetch {} for {} failed permanently (not retrying): {}",
-                row.id, row.commit_hash, msg
-            );
-        } else if now - first >= RETRY_WINDOW_SECS {
-            error!(
-                "Fetch {} for {} exhausted its {}h retry window: {}",
-                row.id,
-                row.commit_hash,
-                RETRY_WINDOW_SECS / 3600,
-                msg
-            );
-        }
-        if permanent || now - first >= RETRY_WINDOW_SECS {
-            if let Err(e) = self.db.mark_fetch_failed(row.id, &msg).await {
-                error!("Failed to mark fetch {} failed: {}", row.id, e);
-            }
-            // Surface the terminal failure so the placeholder patchset moves out
-            // of 'Fetching' into 'Failed'.
-            if let Err(e) = self
-                .main_tx
-                .send(Event::IngestionFailed {
-                    article_id: Self::article_id_for(row),
-                    error: msg.clone(),
-                    source: MessageSource::GitFetch,
-                })
-                .await
-            {
-                warn!(
-                    "Failed to send IngestionFailed event for fetch {}: {}",
-                    row.id, e
-                );
-            }
-        } else {
-            self.schedule_retry(row, &msg, now).await;
-        }
-    }
-
     /// Process a single claimed fetch: ensure the commits are present locally
     /// (fetching from the remote if needed), extract the patch(es), and emit the
     /// corresponding events. On any failure the row is retried with backoff, or
@@ -592,6 +546,51 @@ impl FetchWorker {
             info!("Submitted patch {}", row.commit_hash);
         }
         Ok(())
+    }
+
+    /// Decide whether to retry (with backoff) or terminally fail a fetch.
+    async fn handle_failure(&self, row: &FetchQueueRow, error: anyhow::Error) {
+        let now = now_secs();
+        let first = row.first_attempt_at.unwrap_or(now);
+        let permanent = error.chain().any(|e| e.is::<PermanentFetchError>());
+        let msg = format!("{:#}", error);
+        if permanent {
+            error!(
+                "Fetch {} for {} failed permanently (not retrying): {}",
+                row.id, row.commit_hash, msg
+            );
+        } else if now - first >= RETRY_WINDOW_SECS {
+            error!(
+                "Fetch {} for {} exhausted its {}h retry window: {}",
+                row.id,
+                row.commit_hash,
+                RETRY_WINDOW_SECS / 3600,
+                msg
+            );
+        }
+        if permanent || now - first >= RETRY_WINDOW_SECS {
+            if let Err(e) = self.db.mark_fetch_failed(row.id, &msg).await {
+                error!("Failed to mark fetch {} failed: {}", row.id, e);
+            }
+            // Surface the terminal failure so the placeholder patchset moves out
+            // of 'Fetching' into 'Failed'.
+            if let Err(e) = self
+                .main_tx
+                .send(Event::IngestionFailed {
+                    article_id: Self::article_id_for(row),
+                    error: msg.clone(),
+                    source: MessageSource::GitFetch,
+                })
+                .await
+            {
+                warn!(
+                    "Failed to send IngestionFailed event for fetch {}: {}",
+                    row.id, e
+                );
+            }
+        } else {
+            self.schedule_retry(row, &msg, now).await;
+        }
     }
 
     async fn schedule_retry(&self, row: &FetchQueueRow, msg: &str, now: i64) {
