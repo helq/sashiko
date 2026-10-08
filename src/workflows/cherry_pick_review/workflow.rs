@@ -527,3 +527,42 @@ fn format_stage8_feedback(violation: &str) -> String {
         violation
     )
 }
+
+#[allow(dead_code)]
+fn validate_stage9(val: &Value, _state: &CherryPickState) -> Result<(), String> {
+    if let Some(c) = val.get("concerns") {
+        if let Some(arr) = c.as_array() {
+            for item in arr {
+                if !item.is_object() {
+                    return Err("elements in 'concerns' array must be objects".to_string());
+                }
+            }
+        } else {
+            return Err("output 'concerns' is not an array".to_string());
+        }
+    } else {
+        return Err("missing 'concerns' array in output".to_string());
+    }
+    if let Some(c) = val.get("dismissed_concerns") {
+        if let Some(arr) = c.as_array() {
+            for item in arr {
+                if !item.is_object() {
+                    return Err(
+                        "elements in 'dismissed_concerns' array must be objects".to_string()
+                    );
+                }
+            }
+        } else {
+            return Err("output 'dismissed_concerns' is not an array".to_string());
+        }
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn format_stage9_feedback(violation: &str) -> String {
+    format!(
+        "\n\nPrevious attempt was rejected: {}. You MUST return ONLY a JSON object containing 'concerns' and optional 'dismissed_concerns' arrays. If there are no remaining concerns, return `{{\"concerns\": [], \"dismissed_concerns\": []}}`.",
+        violation
+    )
+}
