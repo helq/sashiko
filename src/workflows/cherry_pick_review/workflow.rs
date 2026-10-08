@@ -122,3 +122,36 @@ pub struct CherryPickState {
 
 /// Type alias for compatibility with synthesis builders and tests.
 pub type WorkflowState = CherryPickState;
+
+#[allow(dead_code)]
+async fn read_bounded_git_output(
+    mut child: tokio::process::Child,
+    limit: usize,
+) -> std::io::Result<std::process::Output> {
+    use tokio::io::AsyncReadExt;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+
+    let read_stdout = async {
+        if let Some(out) = stdout_pipe.take() {
+            out.take(limit as u64).read_to_end(&mut stdout).await?;
+        }
+        Ok::<_, std::io::Error>(())
+    };
+    let read_stderr = async {
+        if let Some(err) = stderr_pipe.take() {
+            err.take(limit as u64).read_to_end(&mut stderr).await?;
+        }
+        Ok::<_, std::io::Error>(())
+    };
+
+    tokio::try_join!(read_stdout, read_stderr)?;
+    let status = child.wait().await?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
