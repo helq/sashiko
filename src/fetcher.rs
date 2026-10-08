@@ -735,6 +735,105 @@ impl FetchWorker {
         Ok(())
     }
 
+    /// Pre-fetch all missing objects across a batch of claimed rows in a single
+    /// git fetch call per remote. This maximizes pack negotiation efficiency so
+    /// the server can compute one optimal pack.
+    #[allow(dead_code)]
+    async fn batch_prefetch(&self, rows: &[FetchQueueRow]) {
+        // Remotes where fewer than two rows have missing commits are skipped so
+        // a single failing row is not fetched twice back-to-back (once in
+        // batch_prefetch and immediately again in ensure_present).
+        if rows.len() < 2 {
+            return;
+        }
+
+        // Group missing SHAs and contributing row count by remote URL.
+        let mut by_remote: std::collections::HashMap<String, (usize, Vec<String>)> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let url = row.repo_url.as_deref().unwrap_or("").trim().to_string();
+            if url.is_empty() {
+                continue;
+            }
+            let mut commits = match parse_commit_range_endpoints(&row.commit_hash) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(
+                        "batch_prefetch: skipping invalid range in row {}: {}",
+                        row.id, e
+                    );
+                    continue;
+                }
+            };
+            for sha in &row.supporting_commits {
+                match parse_commit_range_endpoints(sha) {
+                    Ok(c) => commits.extend(c),
+                    Err(e) => {
+                        warn!(
+                            "batch_prefetch: skipping invalid supporting commit in row {}: {}",
+                            row.id, e
+                        );
+                    }
+                }
+            }
+
+            let mut row_missing = Vec::new();
+            for c in commits {
+                let trimmed = c.trim();
+                if trimmed.is_empty()
+                    || trimmed.chars().any(char::is_whitespace)
+                    || trimmed.starts_with('-')
+                    || trimmed.starts_with('+')
+                    || trimmed.contains(':')
+                {
+                    continue;
+                }
+                if !self.is_present(trimmed).await {
+                    row_missing.push(trimmed.to_string());
+                }
+            }
+            if !row_missing.is_empty() {
+                let entry = by_remote.entry(url).or_insert_with(|| (0, Vec::new()));
+                entry.0 += 1;
+                entry.1.extend(row_missing);
+            }
+        }
+
+        for (url, (row_count, missing)) in &mut by_remote {
+            if *row_count < 2 {
+                continue;
+            }
+            missing.sort();
+            missing.dedup();
+            if missing.is_empty() {
+                continue;
+            }
+
+            let remote_name = self.get_remote_name(url);
+            if let Err(e) = self.ensure_remote(&remote_name, url).await {
+                warn!(
+                    "batch_prefetch: failed to ensure remote {}: {}",
+                    redact_secret(url),
+                    e
+                );
+                continue;
+            }
+            info!(
+                "batch_prefetch: fetching {} SHAs across {} rows from {} in one call",
+                missing.len(),
+                row_count,
+                redact_secret(url)
+            );
+            // Acquire the per-remote lock so we never run concurrent fetches
+            // against the same remote.
+            let lock = crate::git_ops::get_remote_lock(&remote_name);
+            let _guard = lock.lock().await;
+            if let Err(e) = self.fetch_commits(&remote_name, missing).await {
+                warn!("batch_prefetch: batch fetch failed: {}", e);
+            }
+        }
+    }
+
     async fn fetch_all(&self, remote: &str) -> Result<()> {
         let output = self.fetch_with_graph_retry(&[remote]).await?;
 
