@@ -1279,3 +1279,435 @@ fn format_stage12_feedback(violation: &str) -> String {
         violation
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::{AiRequest, AiResponse, ProviderCapabilities};
+    use crate::review_kind::ReviewKind;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    struct QueuedMockProvider {
+        responses: Mutex<VecDeque<String>>,
+        requests: Mutex<Vec<AiRequest>>,
+    }
+
+    impl QueuedMockProvider {
+        fn new(resps: Vec<&str>) -> Self {
+            Self {
+                responses: Mutex::new(resps.into_iter().map(String::from).collect()),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AiProvider for QueuedMockProvider {
+        async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+            self.requests.lock().unwrap().push(request);
+            let content = self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| r#"{"concerns": [], "dismissed_concerns": []}"#.to_string());
+            Ok(AiResponse {
+                content: Some(content),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: Some(crate::ai::AiUsage {
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                    total_tokens: 15,
+                    cached_tokens: Some(1),
+                }),
+                truncated: false,
+            })
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "mock".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    #[test]
+    fn git_metadata_contains_three_commits() {
+        let state = CherryPickState {
+            original_sha: "aaa111".to_string(),
+            base_sha: "bbb222".to_string(),
+            resolution_sha: "ccc333".to_string(),
+            original_subject: "orig subject".to_string(),
+            base_subject: "base subject".to_string(),
+            resolution_subject: "res subject".to_string(),
+            original_diff: "diff --git a/x b/x\n".to_string(),
+            ..Default::default()
+        };
+        let md = cherry_pick_system_prompt(true).render_for_log(&state);
+        assert!(md.contains("aaa111"));
+        assert!(md.contains("bbb222"));
+        assert!(md.contains("ccc333"));
+        assert!(md.contains("orig subject"));
+        assert!(md.contains("<original_patch_diff>"));
+        assert!(md.contains("MERGE-CONFLICT RESOLUTION REVIEW"));
+    }
+
+    #[test]
+    fn from_review_kind_extracts_shas() {
+        let kind = ReviewKind::CherryPick {
+            original_sha: "orig".to_string(),
+            base_sha: Some("base".to_string()),
+        };
+        let p = CherryPickReviewWorkflow::from_review_kind(&kind, "res".to_string());
+        assert_eq!(p.original_sha, "orig");
+        assert_eq!(p.base_sha.as_deref(), Some("base"));
+        assert_eq!(p.resolution_sha, "res");
+    }
+
+    #[test]
+    fn from_review_kind_handles_none_base_sha() {
+        let kind = ReviewKind::CherryPick {
+            original_sha: "orig".to_string(),
+            base_sha: None,
+        };
+        let p = CherryPickReviewWorkflow::from_review_kind(&kind, "res".to_string());
+        assert_eq!(p.original_sha, "orig");
+        assert_eq!(p.base_sha, None);
+        assert_eq!(p.resolution_sha, "res");
+    }
+
+    #[test]
+    fn stage8_builder_injects_state() {
+        let state = CherryPickState {
+            concerns: vec![serde_json::json!({"type": "TestConcern"})],
+            ..Default::default()
+        };
+        let build = synthesis::stage8_builder();
+        let (user, clean) = build("# Stage 8 instruction", &state);
+        assert!(user.contains("# Stage 8 instruction"));
+        assert!(user.contains("Consolidated Concerns:"));
+        assert!(user.contains("TestConcern"));
+        assert_eq!(user, clean);
+    }
+
+    #[tokio::test]
+    async fn execute_workflow_early_exit_when_no_concerns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prompts = PromptRegistry::new(tmp.path().to_path_buf());
+        // Planning response + 4 analysis stage responses (stages 1, 2, 3 + planned 4)
+        let provider = Arc::new(QueuedMockProvider::new(vec![
+            r#"{"relevant_stages": [4]}"#,
+            r#"{"concerns": [], "dismissed_concerns": []}"#,
+            r#"{"concerns": [], "dismissed_concerns": []}"#,
+            r#"{"concerns": [], "dismissed_concerns": []}"#,
+            r#"{"concerns": [], "dismissed_concerns": []}"#,
+        ]));
+        let env = CherryPickWorkflowEnv {
+            provider: provider.clone(),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            prompts: &prompts,
+            temperature: 0.0,
+            max_interactions: 3,
+            context_tag: Some("[ps:1 p:1] ".to_string()),
+            stages: None,
+            series_range: None,
+            custom_prompt: None,
+        };
+        let workflow = CherryPickReviewWorkflow::new("orig", Some("base".to_string()), "res");
+        let result = execute_workflow(&workflow, &env, json!({"subject": "test"}), None)
+            .await
+            .unwrap();
+
+        let out = result.output.unwrap();
+        assert_eq!(out["review_inline"], "No issues found.");
+        assert_eq!(out["concerns_count"], 0);
+        // Planning usage (10 in, 5 out) + 4 analysis stages * 10 = 50 tokens_in, 25 tokens_out
+        assert_eq!(result.tokens_in, 50);
+        assert_eq!(result.tokens_out, 25);
+
+        // Verify planning request had system configured and context_tag = None,
+        // while stage 1 had context_tag "[ps:1 p:1] "
+        let reqs = provider.requests.lock().unwrap();
+        assert!(reqs[0].system.is_some());
+        assert_eq!(reqs[1].context_tag.as_deref(), Some("[ps:1 p:1] "));
+    }
+
+    #[tokio::test]
+    async fn execute_workflow_full_run_and_progress_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prompts = PromptRegistry::new(tmp.path().to_path_buf());
+        let report_text = "commit abcdef123456\nAuthor: Test Author <test@example.com>\n\nSummary of conflict resolution bug.\n\n> +bad_code();\n\nThis introduces a memory leak.";
+        let provider = Arc::new(QueuedMockProvider::new(vec![
+            // Stage 1 raises a concern
+            r#"{"concerns": [{"type": "Bug", "description": "leak"}], "dismissed_concerns": []}"#,
+            // Stages 2 & 3 raise nothing
+            r#"{"concerns": [], "dismissed_concerns": []}"#,
+            r#"{"concerns": [], "dismissed_concerns": []}"#,
+            // Stage 8 dedup
+            r#"{"concerns": [{"type": "Bug", "description": "leak"}], "dismissed_concerns": []}"#,
+            // Stage 9 resolution
+            r#"{"concerns": [{"type": "Bug", "description": "leak"}]}"#,
+            // Stage 10 verification
+            r#"{"findings": [
+                {"problem": "leak", "severity": "high"},
+                {"problem": "old", "severity": "high", "severity_explanation": "detailed proof"}
+            ]}"#,
+            // Origin classification (stage 11)
+            r#"{"findings": [
+                {"problem": "leak", "severity": "high", "origin": "resolution_introduced"},
+                {"problem": "old", "severity": "high", "origin": "base_preexisting", "severity_explanation": "detailed proof"}
+            ]}"#,
+            // Stage 12 report
+            report_text,
+        ]));
+        let env = CherryPickWorkflowEnv {
+            provider,
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            prompts: &prompts,
+            temperature: 0.0,
+            max_interactions: 3,
+            context_tag: None,
+            // Manual stages = [1, 2, 3] so planner is skipped
+            stages: Some(vec![1, 2, 3]),
+            series_range: None,
+            custom_prompt: None,
+        };
+        let workflow = CherryPickReviewWorkflow::new("orig", Some("base".to_string()), "res");
+        let events = std::sync::Mutex::new(Vec::new());
+        let progress = |ev: WorkerProgressEvent| {
+            events.lock().unwrap().push(ev);
+        };
+        let result = execute_workflow(&workflow, &env, json!({"subject": "test"}), Some(&progress))
+            .await
+            .unwrap();
+
+        let out = result.output.unwrap();
+        assert_eq!(out["review_inline"], report_text);
+        // classified_findings retains both findings (before filter)
+        assert_eq!(out["classified_findings"].as_array().unwrap().len(), 2);
+        // findings has filtered findings (only resolution_introduced high/crit)
+        assert_eq!(out["findings"].as_array().unwrap().len(), 1);
+        assert_eq!(out["concerns"].as_array().unwrap().len(), 1);
+        assert_eq!(out["concerns"][0]["reasoning"], "detailed proof");
+        assert_eq!(out["concerns_count"], 1);
+        // History starts with System prompt
+        assert_eq!(result.history[0].role, crate::ai::AiRole::System);
+
+        // Verify StageStarted events emitted for 1, 2, 3, 8, 9, 10, 11, 12
+        let started_stages: Vec<String> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                WorkerProgressEvent::StageStarted { stage } => Some(stage.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            started_stages,
+            vec!["1", "2", "3", "8", "9", "10", "11", "12"]
+        );
+
+        let review_started: Vec<Vec<String>> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                WorkerProgressEvent::ReviewStarted { planned_stages } => {
+                    Some(planned_stages.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            review_started,
+            vec![vec!["1", "2", "3", "8", "9", "10", "11", "12"]]
+        );
+    }
+
+    #[test]
+    fn test_stage8_and_stage9_reducers_on_prepopulated_state() {
+        let mut state = CherryPickState {
+            concerns: vec![
+                json!({"title": "c1", "description": "from stage 1"}),
+                json!({"title": "c2", "description": "from stage 2"}),
+                json!({"title": "c3", "description": "from stage 3"}),
+            ],
+            dismissed_concerns: vec![json!({"title": "d0", "description": "early dismissed"})],
+            ..Default::default()
+        };
+
+        // Stage 8 reducer overwrites both concerns and dismissed_concerns
+        let s8_val = json!({
+            "concerns": [
+                {"title": "c1_dedup", "description": "merged c1 and c2"}
+            ],
+            "dismissed_concerns": [
+                {"title": "d1", "description": "dismissed in stage 8"}
+            ]
+        });
+        if let Some(arr) = s8_val.get("concerns").and_then(|v| v.as_array()) {
+            state.concerns = arr.clone();
+        }
+        if let Some(arr) = s8_val.get("dismissed_concerns").and_then(|v| v.as_array()) {
+            state.dismissed_concerns = arr.clone();
+        }
+        assert_eq!(state.concerns.len(), 1);
+        assert_eq!(state.concerns[0]["title"], "c1_dedup");
+        assert_eq!(state.dismissed_concerns.len(), 1);
+        assert_eq!(state.dismissed_concerns[0]["title"], "d1");
+
+        // Stage 9 reducer overwrites concerns and extends dismissed_concerns with deduplication
+        let s9_val = json!({
+            "concerns": [
+                {"title": "c1_resolved", "description": "resolved conflict"}
+            ],
+            "dismissed_concerns": [
+                {"title": "d1", "description": "dismissed in stage 8"},
+                {"title": "d2", "description": "dismissed in stage 9"}
+            ]
+        });
+        if let Some(arr) = s9_val.get("concerns").and_then(|v| v.as_array()) {
+            state.concerns = arr.clone();
+        }
+        if let Some(arr) = s9_val.get("dismissed_concerns").and_then(|v| v.as_array()) {
+            for item in arr {
+                if !state.dismissed_concerns.contains(item) {
+                    state.dismissed_concerns.push(item.clone());
+                }
+            }
+        }
+        assert_eq!(state.concerns.len(), 1);
+        assert_eq!(state.concerns[0]["title"], "c1_resolved");
+        assert_eq!(state.dismissed_concerns.len(), 2);
+        assert_eq!(state.dismissed_concerns[0]["title"], "d1");
+        assert_eq!(state.dismissed_concerns[1]["title"], "d2");
+    }
+
+    #[test]
+    fn test_validate_stage10() {
+        let state = CherryPickState::default();
+
+        for sev in &[
+            "low", "medium", "high", "critical", "Low", "MEDIUM", "High", "CRITICAL",
+        ] {
+            let val = json!({
+                "findings": [
+                    {"problem": "issue", "severity": sev}
+                ]
+            });
+            assert!(validate_stage10(&val, &state).is_ok());
+        }
+
+        let val_no_findings = json!({});
+        assert_eq!(
+            validate_stage10(&val_no_findings, &state).unwrap_err(),
+            "missing 'findings' array in output"
+        );
+
+        let val_no_sev = json!({
+            "findings": [{"problem": "issue"}]
+        });
+        assert_eq!(
+            validate_stage10(&val_no_sev, &state).unwrap_err(),
+            "missing or invalid 'severity' field in finding"
+        );
+
+        let val_bad_sev = json!({
+            "findings": [{"problem": "issue", "severity": "unknown"}]
+        });
+        assert_eq!(
+            validate_stage10(&val_bad_sev, &state).unwrap_err(),
+            "missing or invalid 'severity' field in finding"
+        );
+    }
+
+    #[test]
+    fn test_validate_stage_origin() {
+        let state = CherryPickState::default();
+
+        for origin in &[
+            "resolution_introduced",
+            "original_patch_preexisting",
+            "base_preexisting",
+            "Resolution_Introduced",
+            "ORIGINAL_PATCH_PREEXISTING",
+        ] {
+            let val = json!({
+                "findings": [
+                    {"problem": "issue", "severity": "high", "origin": origin}
+                ]
+            });
+            assert!(validate_stage_origin(&val, &state).is_ok());
+        }
+
+        let val_no_origin = json!({
+            "findings": [
+                {"problem": "issue", "severity": "high"}
+            ]
+        });
+        assert_eq!(
+            validate_stage_origin(&val_no_origin, &state).unwrap_err(),
+            "missing or invalid 'origin' field in finding"
+        );
+
+        let val_bad_origin = json!({
+            "findings": [
+                {"problem": "issue", "severity": "high", "origin": "unknown"}
+            ]
+        });
+        assert_eq!(
+            validate_stage_origin(&val_bad_origin, &state).unwrap_err(),
+            "missing or invalid 'origin' field in finding"
+        );
+
+        let val_bad_sev = json!({
+            "findings": [
+                {"problem": "issue", "severity": "unknown", "origin": "resolution_introduced"}
+            ]
+        });
+        assert_eq!(
+            validate_stage_origin(&val_bad_sev, &state).unwrap_err(),
+            "missing or invalid 'severity' field in finding"
+        );
+    }
+
+    #[test]
+    fn test_format_stage_origin_feedback() {
+        let msg = format_stage_origin_feedback("missing or invalid 'origin' field in finding");
+        assert!(msg.contains("Previous attempt was rejected"));
+        assert!(msg.contains("missing or invalid 'origin' field in finding"));
+
+        let parse_err = format_stage_origin_feedback("Failed to parse JSON from output: error");
+        assert!(parse_err.contains("missing 'findings' array in output"));
+    }
+
+    #[test]
+    fn test_findings_empty_distinguishes_empty_array_from_non_array() {
+        let mut state = CherryPickState::default();
+        // None is not considered empty by findings_empty
+        assert!(!findings_empty(&state));
+
+        // Some(empty array) is considered empty
+        state.findings = Some(json!([]));
+        assert!(findings_empty(&state));
+
+        // Some(non-empty array) is not empty
+        state.findings = Some(json!([{"problem": "issue"}]));
+        assert!(!findings_empty(&state));
+
+        // Non-array JSON values must never be treated as empty findings
+        state.findings = Some(json!({"invalid": "object"}));
+        assert!(!findings_empty(&state));
+
+        state.findings = Some(json!("string"));
+        assert!(!findings_empty(&state));
+
+        state.findings = Some(json!(12345));
+        assert!(!findings_empty(&state));
+    }
+}
