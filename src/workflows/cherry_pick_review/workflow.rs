@@ -29,7 +29,7 @@ use crate::ai::AiProvider;
 use crate::toolbox::ToolBox;
 use crate::worker::prompts::PromptRegistry;
 use crate::workflow::{
-    OutputFormat, PromptTemplate, RecitationPolicy, Stage, StagePolicy, ToolScope,
+    ExecutableStage, OutputFormat, PromptTemplate, RecitationPolicy, Stage, StagePolicy, ToolScope,
 };
 use crate::workflows::linux_patch_review;
 
@@ -532,6 +532,29 @@ fn build_planning_stage() -> Stage<CherryPickState, Value> {
             state.planned_stages = stages;
         })
         .build()
+}
+
+#[allow(dead_code)]
+fn build_analysis_resolver(
+    max_turns: usize,
+    temperature: f32,
+) -> impl Fn(&CherryPickState) -> Vec<Box<dyn ExecutableStage<CherryPickState>>> {
+    move |state: &CherryPickState| {
+        let should_run = |n: u8| -> bool {
+            if let Some(ref manual) = state.manual_stages {
+                manual.contains(&n)
+            } else {
+                state.planned_stages.contains(&n)
+            }
+        };
+        let mut stages: Vec<Box<dyn ExecutableStage<CherryPickState>>> = Vec::new();
+        for n in 1..=7 {
+            if should_run(n) {
+                stages.push(Box::new(build_analysis_stage(n, max_turns, temperature)));
+            }
+        }
+        stages
+    }
 }
 
 #[allow(dead_code)]
