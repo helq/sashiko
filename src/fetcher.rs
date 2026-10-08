@@ -577,30 +577,79 @@ impl FetchAgent {
         }
     }
 
+    /// Fetch the given revisions from `remote`, tuned for a very large remote.
+    ///
+    /// Full object ids are fetched directly (`want <oid>`) in a single batched
+    /// call with no ref advertisement. Branch/tag names are resolved server-side
+    /// via a protocol-v2, prefix-filtered `ls-refs` (cheap even against a remote
+    /// with hundreds of thousands of refs) and fetched individually so one bad
+    /// name does not fail the whole batch.
     async fn fetch_commits(&self, remote: &str, commits: &[String]) -> Result<()> {
-        let mut args = vec![remote];
-        for commit in commits {
-            if commit.is_empty()
-                || commit.chars().any(char::is_whitespace)
-                || commit.starts_with('-')
-                || commit.starts_with('+')
-                || commit.contains(':')
+        let mut object_ids: Vec<&str> = Vec::new();
+        let mut ref_names: Vec<&str> = Vec::new();
+        for c in commits {
+            if c.is_empty()
+                || c.chars().any(char::is_whitespace)
+                || c.starts_with('-')
+                || c.starts_with('+')
+                || c.contains(':')
             {
-                warn!("Skipping invalid commit ref in fetch batch: {}", commit);
+                warn!("Skipping invalid commit ref in fetch batch: {}", c);
                 continue;
             }
-            args.push(commit.as_str());
+            if looks_like_object_id(c) {
+                object_ids.push(c.as_str());
+            } else {
+                ref_names.push(c.as_str());
+            }
         }
-        if args.len() == 1 {
+
+        if object_ids.is_empty() && ref_names.is_empty() {
             return Err(anyhow!("No valid commit refs to fetch"));
         }
 
-        let output = self.fetch_with_graph_retry(&args).await?;
-        if !output.status.success() {
-            return Err(anyhow!(
-                "Fetch failed: {}",
-                redact_secret(String::from_utf8_lossy(&output.stderr).trim())
-            ));
+        if !object_ids.is_empty() {
+            let mut args = vec![
+                "--no-tags",
+                "--no-write-fetch-head",
+                "--end-of-options",
+                remote,
+            ];
+            args.extend(object_ids.iter().copied());
+            let output = self.fetch_with_graph_retry(&args).await?;
+            if !output.status.success() {
+                return Err(anyhow!(
+                    "fetch of {} object(s) failed: {}",
+                    object_ids.len(),
+                    redact_secret(String::from_utf8_lossy(&output.stderr).trim())
+                ));
+            }
+        }
+
+        let mut first_err = None;
+        for name in ref_names {
+            let output = self
+                .fetch_with_graph_retry(&[
+                    "--no-tags",
+                    "--no-write-fetch-head",
+                    "--end-of-options",
+                    remote,
+                    name,
+                ])
+                .await?;
+            if !output.status.success() {
+                let err = anyhow!(
+                    "fetch of ref {} failed: {}",
+                    name,
+                    redact_secret(String::from_utf8_lossy(&output.stderr).trim())
+                );
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
+            }
+        }
+        if let Some(err) = first_err {
+            return Err(err);
         }
         Ok(())
     }
