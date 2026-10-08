@@ -18,6 +18,7 @@
 //! patch and the target base, isolating bugs introduced by the resolution
 //! from pre-existing issues.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -154,4 +155,63 @@ async fn read_bounded_git_output(
         stdout,
         stderr,
     })
+}
+
+#[allow(dead_code)]
+async fn git_output(worktree: &Path, args: &[&str]) -> Option<String> {
+    let child = match crate::git_cmd::in_dir_async(worktree)
+        .kill_on_drop(true)
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            tracing::warn!("Failed to spawn git {:?}: {}", args, e);
+            return None;
+        }
+    };
+
+    const MAX_GIT_BYTES: usize = 5 * 1024 * 1024; // 5MB cap
+    let timeout_duration = std::time::Duration::from_secs(30);
+    let output = match tokio::time::timeout(
+        timeout_duration,
+        read_bounded_git_output(child, MAX_GIT_BYTES),
+    )
+    .await
+    {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => {
+            tracing::warn!("Error reading git {:?} output: {}", args, e);
+            return None;
+        }
+        Err(_) => {
+            tracing::warn!("Timeout waiting for git {:?}", args);
+            return None;
+        }
+    };
+
+    if output.status.success() || output.stdout.len() >= MAX_GIT_BYTES {
+        let text = if output.stdout.len() >= MAX_GIT_BYTES {
+            let slice = &output.stdout[..MAX_GIT_BYTES];
+            let cut = slice
+                .iter()
+                .rposition(|b| *b == b'\n')
+                .unwrap_or(MAX_GIT_BYTES);
+            let mut s = String::from_utf8_lossy(&slice[..cut]).into_owned();
+            s.push_str("\n[... output truncated at 5MB limit ...]\n");
+            s
+        } else {
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+        Some(text)
+    } else {
+        tracing::warn!(
+            "git command failed: {:?}, stderr: {}",
+            args,
+            crate::utils::redact_secret(&String::from_utf8_lossy(&output.stderr))
+        );
+        None
+    }
 }
