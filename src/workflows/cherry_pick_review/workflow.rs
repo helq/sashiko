@@ -138,11 +138,41 @@ impl CherryPickReviewWorkflow {
             }
         };
         let resolution_diff = extract_resolution_diff(patchset);
+        let resolution_diff_with_log = match git_show(worktree, &self.resolution_sha).await {
+            Some(show) if !show.trim().is_empty() => show,
+            _ => {
+                if let Some(show) = patchset.get("git_show").and_then(|v| v.as_str()) {
+                    show.to_string()
+                } else if let Some(header) = git_output(
+                    worktree,
+                    &[
+                        "show",
+                        "-s",
+                        "--format=commit %H%nAuthor: %an <%ae>%nDate: %ad%n%n%B",
+                        "--end-of-options",
+                        &self.resolution_sha,
+                    ],
+                )
+                .await
+                {
+                    format!("{}\n\n{}", header.trim(), resolution_diff)
+                } else if let Some(author) = patchset.get("author").and_then(|v| v.as_str()) {
+                    let subject = resolution_subject.as_deref().unwrap_or("(unknown)");
+                    format!(
+                        "commit {}\nAuthor: {}\n\n    {}\n\n{}",
+                        self.resolution_sha, author, subject, resolution_diff
+                    )
+                } else {
+                    resolution_diff.clone()
+                }
+            }
+        };
 
         Ok(CherryPickState {
             original_sha: self.original_sha.clone(),
             resolution_sha: self.resolution_sha.clone(),
             original_diff,
+            target_commit: resolution_diff_with_log,
             target_commit_diff: resolution_diff,
             ..Default::default()
         })
