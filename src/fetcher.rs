@@ -445,83 +445,6 @@ impl FetchAgent {
                     missing_commits
                 );
             }
-
-            // 3. Process each commit or range
-            for commit_or_range in commit_list {
-                if commit_or_range.contains("..") {
-                    // It's a range
-                    let range = &commit_or_range;
-
-                    let shas = match crate::git_ops::resolve_git_range(&self.repo_path, range).await
-                    {
-                        Ok(shas) => shas,
-                        Err(e) => {
-                            let _ = self
-                                .main_tx
-                                .send(Event::IngestionFailed {
-                                    article_id: range.clone(),
-                                    error: format!(
-                                        "Failed to resolve git range: {}",
-                                        redact_secret(&e.to_string())
-                                    ),
-                                    source: MessageSource::GitFetch,
-                                })
-                                .await;
-                            continue;
-                        }
-                    };
-                    let count = shas.len() as u32;
-
-                    // Process each SHA
-                    let (mr_url, mr_title, mr_number) = self
-                        .mr_metadata
-                        .get(range)
-                        .cloned()
-                        .unwrap_or((None, None, None));
-
-                    let article_id = if let Some(number) = mr_number {
-                        format!("mr-{}-{}", number, range)
-                    } else {
-                        range.to_string()
-                    };
-
-                    for (i, sha) in shas.iter().enumerate() {
-                        match self
-                            .extract_patch(
-                                sha,
-                                &article_id,
-                                (i + 1) as u32,
-                                count,
-                                mr_url.as_ref(),
-                                mr_title.as_ref(),
-                                mr_number,
-                            )
-                            .await
-                        {
-                            Ok(mut event) => {
-                                if let Event::PatchSubmitted {
-                                    ref mut message_id, ..
-                                } = event
-                                {
-                                    *message_id = sha.clone();
-                                }
-                                if let Err(e) = self.main_tx.send(event).await {
-                                    error!("Failed to send PatchSubmitted event: {}", e);
-                                }
-                            }
-                            Err(e) => {
-                                error!(
-                                    "Failed to extract patch {} from range {}: {}",
-                                    sha,
-                                    range,
-                                    redact_secret(&e.to_string())
-                                );
-                            }
-                        }
-                    }
-                    info!("Successfully submitted remote range {}", range);
-                }
-            }
         }
     }
 
@@ -809,6 +732,7 @@ impl FetchAgent {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
+    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     async fn extract_patch(
         &self,
