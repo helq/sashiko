@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::db::Database;
+use crate::db::{Database, FetchQueueRow};
 use crate::events::{Event, MessageSource};
 use crate::utils::redact_secret;
 use anyhow::{Result, anyhow};
@@ -176,6 +176,71 @@ impl FetchWorker {
             db,
             main_tx,
             gitlab_token,
+        }
+    }
+
+    /// Decide whether to retry (with backoff) or terminally fail a fetch.
+    #[allow(dead_code)]
+    async fn handle_failure(&self, row: &FetchQueueRow, error: anyhow::Error) {
+        let now = now_secs();
+        let first = row.first_attempt_at.unwrap_or(now);
+        let permanent = error.chain().any(|e| e.is::<PermanentFetchError>());
+        let msg = format!("{:#}", error);
+        if permanent {
+            error!(
+                "Fetch {} for {} failed permanently (not retrying): {}",
+                row.id, row.commit_hash, msg
+            );
+        } else if now - first >= RETRY_WINDOW_SECS {
+            error!(
+                "Fetch {} for {} exhausted its {}h retry window: {}",
+                row.id,
+                row.commit_hash,
+                RETRY_WINDOW_SECS / 3600,
+                msg
+            );
+        }
+        if permanent || now - first >= RETRY_WINDOW_SECS {
+            if let Err(e) = self.db.mark_fetch_failed(row.id, &msg).await {
+                error!("Failed to mark fetch {} failed: {}", row.id, e);
+            }
+            // Surface the terminal failure so the placeholder patchset moves out
+            // of 'Fetching' into 'Failed'.
+            if let Err(e) = self
+                .main_tx
+                .send(Event::IngestionFailed {
+                    article_id: Self::article_id_for(row),
+                    error: msg.clone(),
+                    source: MessageSource::GitFetch,
+                })
+                .await
+            {
+                warn!(
+                    "Failed to send IngestionFailed event for fetch {}: {}",
+                    row.id, e
+                );
+            }
+        } else {
+            let backoff = backoff_secs(row.attempts);
+            warn!(
+                "Fetch {} for {} failed (attempt {}), retrying in {}s: {}",
+                row.id, row.commit_hash, row.attempts, backoff, msg
+            );
+            if let Err(e) = self
+                .db
+                .set_fetch_retry_at(row.id, now + backoff, &msg)
+                .await
+            {
+                error!("Failed to schedule retry for fetch {}: {}", row.id, e);
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn article_id_for(row: &FetchQueueRow) -> String {
+        match row.mr_number {
+            Some(number) => format!("mr-{}-{}", number, row.commit_hash),
+            None => row.commit_hash.clone(),
         }
     }
 }
@@ -1111,5 +1176,12 @@ mod tests {
         assert!(parse_commit_range_endpoints("base..").is_err());
         assert!(parse_commit_range_endpoints("...head").is_err());
         assert!(parse_commit_range_endpoints("base...").is_err());
+    }
+
+    #[test]
+    fn test_handle_failure_detects_wrapped_permanent_fetch_error() {
+        let err: anyhow::Error = PermanentFetchError("fatal error".to_string()).into();
+        let wrapped = err.context("extract failed");
+        assert!(wrapped.chain().any(|e| e.is::<PermanentFetchError>()));
     }
 }
