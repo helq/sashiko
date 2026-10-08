@@ -18,6 +18,14 @@
 //! patch and the target base, isolating bugs introduced by the resolution
 //! from pre-existing issues.
 
+use std::sync::Arc;
+
+use serde_json::Value;
+
+use crate::ai::AiProvider;
+use crate::toolbox::ToolBox;
+use crate::worker::prompts::PromptRegistry;
+
 /// Declarative workflow definition for reviewing cherry-pick conflict resolutions.
 #[derive(Debug, Clone)]
 pub struct CherryPickReviewWorkflow {
@@ -64,3 +72,53 @@ impl CherryPickReviewWorkflow {
         self
     }
 }
+
+pub struct CherryPickWorkflowEnv<'a> {
+    /// The AI provider.
+    pub provider: Arc<dyn AiProvider>,
+    /// The tool box (worktree-scoped).
+    pub tools: Arc<ToolBox>,
+    /// The prompt registry (for built-in stage prompts + static context).
+    pub prompts: &'a PromptRegistry,
+    /// Sampling temperature.
+    pub temperature: f32,
+    /// Maximum turns per stage.
+    pub max_interactions: usize,
+    /// Optional context tag for logging.
+    pub context_tag: Option<String>,
+    /// Optional explicit stage list.
+    pub stages: Option<Vec<u8>>,
+    /// Optional series range.
+    pub series_range: Option<String>,
+    /// Optional custom user prompt/instructions.
+    pub custom_prompt: Option<String>,
+}
+
+/// Execution state accumulated across workflow stages.
+#[derive(Default, Clone, Debug)]
+pub struct CherryPickState {
+    pub original_sha: String,
+    pub original_subject: String,
+    pub base_sha: String,
+    pub base_subject: String,
+    pub resolution_sha: String,
+    pub resolution_subject: String,
+    pub original_diff: String,
+    pub target_commit: String,
+    pub target_commit_diff: String,
+    pub prefetched_context: String,
+
+    pub manual_stages: Option<Vec<u8>>,
+    pub planned_stages: Vec<u8>,
+    pub concerns: Vec<Value>,
+    pub total_concerns: usize,
+    pub dismissed_concerns: Vec<Value>,
+    pub findings: Option<Value>,
+    pub classified_findings: Option<Value>,
+    pub review_inline: Option<String>,
+    pub fixes: Option<String>,
+    pub custom_prompt: Option<String>,
+}
+
+/// Type alias for compatibility with synthesis builders and tests.
+pub type WorkflowState = CherryPickState;
