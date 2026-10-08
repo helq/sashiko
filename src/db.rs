@@ -9881,7 +9881,7 @@ impl Database {
                      WHERE commit_hash = ? \
                        AND IFNULL(repo_url, '') = IFNULL(?, '') \
                        AND IFNULL(cover_letter_message_id, '') = IFNULL(?, '') \
-                       AND status IN ('Pending', 'Fetching') \
+                       AND status = 'Pending' \
                  ) \
                  RETURNING id",
                 libsql::params![
@@ -9900,19 +9900,45 @@ impl Database {
                 ],
             )
             .await?;
-        let fetch_id: i64 = match rows.next().await? {
-            Some(row) => row.get(0)?,
-            None => return Ok(()),
-        };
+        let next_row = rows.next().await?;
         drop(rows);
+        let fetch_id: i64 = match next_row {
+            Some(row) => row.get(0)?,
+            None => {
+                if supporting_commits.is_empty() {
+                    return Ok(());
+                }
+                // If the fetch was already queued, ensure any newly supplied
+                // supporting commits are recorded under the existing fetch row.
+                let mut existing = tx
+                    .query(
+                        "SELECT id FROM fetch_queue \
+                         WHERE commit_hash = ? \
+                           AND IFNULL(repo_url, '') = IFNULL(?, '') \
+                           AND IFNULL(cover_letter_message_id, '') = IFNULL(?, '') \
+                           AND status = 'Pending' \
+                         ORDER BY id DESC LIMIT 1",
+                        libsql::params![commit_hash, repo_url, cover_letter_message_id],
+                    )
+                    .await?;
+                match existing.next().await? {
+                    Some(row) => row.get(0)?,
+                    None => return Ok(()),
+                }
+            }
+        };
 
         // Record each supporting commit as its own row (1-to-N) so an arbitrary
         // number can be stored without packing them into a single column.
         for sha in supporting_commits {
             tx.execute(
                 "INSERT INTO fetch_supporting_commits (fetch_id, commit_hash) \
-                 VALUES (?, ?)",
-                libsql::params![fetch_id, sha.as_str()],
+                 SELECT ?, ? \
+                 WHERE NOT EXISTS ( \
+                     SELECT 1 FROM fetch_supporting_commits \
+                     WHERE fetch_id = ? AND commit_hash = ? \
+                 )",
+                libsql::params![fetch_id, sha.as_str(), fetch_id, sha.as_str()],
             )
             .await?;
         }
@@ -12836,6 +12862,72 @@ mod tests {
         // Completing a fetch removes its supporting-commit child rows so the
         // table stays bounded to in-flight work.
         assert_eq!(count_supporting(&db).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_fetch_with_support_deduplication_preserves_supporting_commits() {
+        let db = setup_db().await;
+        // First enqueue without supporting commits.
+        db.enqueue_fetch(None, None, Some("repo"), "commit_x", None, None, None, 500)
+            .await
+            .unwrap();
+
+        // Enqueue again with supporting commits while first is still pending.
+        let supporting = vec!["base_1".to_string(), "base_2".to_string()];
+        db.enqueue_fetch_with_support(
+            None,
+            None,
+            Some("repo"),
+            "commit_x",
+            None,
+            None,
+            None,
+            500,
+            &supporting,
+        )
+        .await
+        .unwrap();
+
+        let row = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(row.commit_hash, "commit_x");
+        assert_eq!(row.supporting_commits, supporting);
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_fetch_with_support_active_fetching_creates_new_pending() {
+        let db = setup_db().await;
+        // First enqueue without supporting commits.
+        db.enqueue_fetch(None, None, Some("repo"), "commit_x", None, None, None, 500)
+            .await
+            .unwrap();
+
+        // Worker claims the fetch so status becomes 'Fetching'.
+        let claimed = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(claimed.commit_hash, "commit_x");
+        assert_eq!(claimed.status, FetchStatus::Fetching);
+
+        // Enqueue again with supporting commits while first is in 'Fetching'.
+        let supporting = vec!["base_1".to_string(), "base_2".to_string()];
+        db.enqueue_fetch_with_support(
+            None,
+            None,
+            Some("repo"),
+            "commit_x",
+            None,
+            None,
+            None,
+            500,
+            &supporting,
+        )
+        .await
+        .unwrap();
+
+        // A new Pending row must be created because the active Fetching row
+        // will delete its supporting commits upon completion.
+        let next_row = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_ne!(next_row.id, claimed.id);
+        assert_eq!(next_row.commit_hash, "commit_x");
+        assert_eq!(next_row.supporting_commits, supporting);
     }
 
     #[tokio::test]
