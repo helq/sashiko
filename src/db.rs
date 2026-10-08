@@ -1433,6 +1433,31 @@ pub struct FetchQueueRow {
     pub supporting_commits: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct StuckFetchPlaceholder {
+    pub patchset_id: i64,
+    pub cover_letter_message_id: Option<String>,
+    pub repo_url: Option<String>,
+    pub mr_url: Option<String>,
+    pub mr_title: Option<String>,
+    pub mr_number: Option<i64>,
+    pub priority: i64,
+}
+
+/// Recover a fetch source URL from a placeholder subject of the form
+/// "Fetching <rev> from <url>...". Returns None when the subject carries no URL
+/// source (e.g. a local fetch, or a thread/PR placeholder).
+#[cfg(feature = "server")]
+fn repo_url_from_subject(subject: &str) -> Option<String> {
+    let after = subject.split_once(" from ")?.1;
+    let url = after.strip_suffix("...").unwrap_or(after).trim();
+    if url.is_empty() || url == "local" {
+        None
+    } else {
+        Some(url.to_string())
+    }
+}
+
 #[cfg(feature = "server")]
 impl Database {
     pub fn has_bug_actor(&self) -> bool {
@@ -10034,6 +10059,52 @@ impl Database {
             )
             .await?;
         Ok(count > 0)
+    }
+
+    /// Return patchsets stuck in 'Fetching' that have no active fetch_queue row.
+    /// Used at startup to recover placeholders created before the durable queue
+    /// existed, or orphaned by a crash.
+    pub async fn get_stuck_fetch_placeholders(&self) -> Result<Vec<StuckFetchPlaceholder>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT p.id, p.cover_letter_message_id, \
+                        COALESCE(p.repo_url, b.repo_url), p.mr_url, \
+                        p.mr_title, p.mr_number, IFNULL(p.priority, 500), \
+                        p.subject \
+                 FROM patchsets p \
+                 LEFT JOIN baselines b ON p.baseline_id = b.id \
+                 WHERE p.status = 'Fetching' \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM fetch_queue fq \
+                       WHERE fq.patchset_id = p.id \
+                         AND fq.status IN ('Pending', 'Fetching') \
+                   ) \
+                 LIMIT 100",
+                (),
+            )
+            .await?;
+
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            // Prefer persisted patchsets.repo_url / baseline url; for old
+            // placeholders that predate the column and have no baseline, recover
+            // the source URL from the subject ("Fetching <rev> from <url>...").
+            let subject = row.get::<Option<String>>(7)?.unwrap_or_default();
+            let repo_url = row
+                .get::<Option<String>>(2)?
+                .or_else(|| repo_url_from_subject(&subject));
+            out.push(StuckFetchPlaceholder {
+                patchset_id: row.get(0)?,
+                cover_letter_message_id: row.get::<Option<String>>(1)?,
+                repo_url,
+                mr_url: row.get::<Option<String>>(3)?,
+                mr_title: row.get::<Option<String>>(4)?,
+                mr_number: row.get::<Option<i64>>(5)?,
+                priority: row.get(6)?,
+            });
+        }
+        Ok(out)
     }
 
     fn row_to_fetch_queue(row: &libsql::Row) -> Result<FetchQueueRow> {
