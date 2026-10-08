@@ -9291,6 +9291,39 @@ impl Database {
         Ok(())
     }
 
+    pub async fn count_patches(&self, patchset_id: i64) -> Result<i64> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM patches WHERE patchset_id = ?",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        if let Some(row) = rows.next().await? {
+            Ok(row.get::<i64>(0)?)
+        } else {
+            Ok(0)
+        }
+    }
+
+    pub async fn is_multi_patch_series(&self, patchset_id: i64) -> Result<bool> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT total_parts FROM patchsets WHERE id = ?",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        let total_parts: Option<u32> = if let Some(row) = rows.next().await? {
+            row.get::<Option<u32>>(0)?
+        } else {
+            None
+        };
+        drop(rows);
+        let patch_count = self.count_patches(patchset_id).await?;
+        Ok(total_parts.is_some_and(|t| t > 1) || patch_count > 1)
+    }
+
     pub async fn cancel_patchset(&self, id: i64, force: bool) -> Result<bool> {
         let allowed_statuses = if force {
             "('Fetching', 'Pending', 'Incomplete', 'In Review')"
