@@ -473,6 +473,36 @@ async fn git_show(worktree: &Path, sha: &str) -> Option<String> {
 }
 
 #[allow(dead_code)]
+fn map_stage_name(name: &str) -> Option<String> {
+    match name {
+        "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "10" | "11" | "12" => {
+            Some(name.to_string())
+        }
+        _ => None,
+    }
+}
+
+#[allow(dead_code)]
+fn build_final_output(state: &CherryPickState) -> Value {
+    json!({
+        "findings": state.findings.clone().unwrap_or_else(|| Value::Array(Vec::new())),
+        "classified_findings": state.classified_findings.clone(),
+        "concerns": Value::Array(state.preexisting_concerns.clone()),
+        "dismissed_concerns": Value::Array(state.dismissed_concerns.clone()),
+        "review_inline": state.review_inline.clone().unwrap_or_else(|| {
+            match &state.findings {
+                None => "No issues found.".to_string(),
+                Some(Value::Array(a)) if a.is_empty() => "No issues found.".to_string(),
+                _ => String::new(),
+            }
+        }),
+        "fixes": state.fixes.clone().unwrap_or_default(),
+        "concerns_count": state.total_concerns,
+        "dismissed_concerns_count": state.dismissed_concerns.len(),
+    })
+}
+
+#[allow(dead_code)]
 fn build_cherry_pick_workflow(max_turns: usize, temperature: f32) -> Workflow<CherryPickState> {
     let planner = build_planning_stage();
     let resolver = build_analysis_resolver(max_turns, temperature);
