@@ -17,7 +17,6 @@ use crate::api::*;
 use crate::baseline::CommitId;
 use crate::db::Database;
 use crate::events::{Event, MessageSource};
-use crate::fetcher::FetchRequest;
 use crate::mbox::LoreMboxClient;
 use axum::{
     Json, Router,
@@ -245,7 +244,6 @@ pub struct AppState {
     pub settings: Arc<crate::settings::Settings>,
     pub db: Arc<Database>,
     pub sender: mpsc::Sender<Event>,
-    pub fetch_sender: mpsc::Sender<FetchRequest>,
     pub forge_registry: Arc<crate::forge::ForgeRegistry>,
     pub read_only: bool,
     pub allow_all_submit: bool,
@@ -288,7 +286,6 @@ pub fn build_router(
     settings: Arc<crate::settings::Settings>,
     db: Arc<Database>,
     sender: mpsc::Sender<Event>,
-    fetch_sender: mpsc::Sender<FetchRequest>,
     options: ServerOptions,
 ) -> Router {
     let forge_registry = Arc::new(crate::forge::ForgeRegistry::new());
@@ -298,7 +295,6 @@ pub fn build_router(
         settings: settings.clone(),
         db,
         sender,
-        fetch_sender,
         read_only,
         forge_registry,
         allow_all_submit: options.allow_all_submit,
@@ -383,10 +379,9 @@ pub async fn run_server(
     settings: Arc<crate::settings::Settings>,
     db: Arc<Database>,
     sender: mpsc::Sender<Event>,
-    fetch_sender: mpsc::Sender<FetchRequest>,
     options: ServerOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let app = build_router(settings.clone(), db, sender, fetch_sender, options);
+    let app = build_router(settings.clone(), db, sender, options);
 
     let bind_addr = format!("{}:{}", settings.server.host, settings.server.port);
     let addrs: Vec<SocketAddr> = bind_addr
@@ -3031,12 +3026,10 @@ mod tests {
         let local_token = crate::auth::LocalToken::generate().unwrap();
         let local_token_secret = local_token.secret().to_string();
         let (event_tx, _event_rx) = mpsc::channel(10);
-        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
         let app = build_router(
             settings,
             db,
             event_tx,
-            fetch_tx,
             ServerOptions {
                 local_token: Some(local_token),
                 ..Default::default()
@@ -3206,12 +3199,10 @@ mod tests {
 
         let local_token = crate::auth::LocalToken::generate().unwrap();
         let (event_tx, _event_rx) = mpsc::channel(10);
-        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
         let app = build_router(
             settings,
             db.clone(),
             event_tx,
-            fetch_tx,
             ServerOptions {
                 local_token: Some(local_token.clone()),
                 ..Default::default()
@@ -3399,14 +3390,7 @@ mod tests {
         settings.server.testing_mode = true;
         let settings = Arc::new(settings);
         let (event_tx, _event_rx) = mpsc::channel(10);
-        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
-        let app = build_router(
-            settings,
-            db.clone(),
-            event_tx,
-            fetch_tx,
-            ServerOptions::default(),
-        );
+        let app = build_router(settings, db.clone(), event_tx, ServerOptions::default());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -3534,7 +3518,6 @@ mod tests {
 
         let settings = Arc::new(settings);
         let (event_tx, _event_rx) = mpsc::channel(10);
-        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
 
         // The capability assertions further down turn on this, since an
         // identity in the security list holds no capability of its own.
@@ -3544,7 +3527,6 @@ mod tests {
             settings.clone(),
             db.clone(),
             event_tx,
-            fetch_tx,
             ServerOptions {
                 dry_run: true,
                 local_token: Some(local_token.clone()),
@@ -3982,13 +3964,11 @@ mod tests {
 
         let settings = Arc::new(base_settings);
         let (event_tx, _event_rx) = mpsc::channel(10);
-        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
 
         let app = build_router(
             settings.clone(),
             db.clone(),
             event_tx.clone(),
-            fetch_tx.clone(),
             ServerOptions {
                 dry_run: true,
                 ..Default::default()
@@ -4178,7 +4158,6 @@ mod tests {
             settings: settings.clone(),
             db: db.clone(),
             sender: event_tx,
-            fetch_sender: fetch_tx,
             read_only: false,
             forge_registry: Arc::new(crate::forge::ForgeRegistry::new()),
             allow_all_submit: false,
@@ -4249,12 +4228,10 @@ mod tests {
         });
 
         let (event_tx, _event_rx) = mpsc::channel(10);
-        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
         let app = build_router(
             Arc::new(settings),
             db.clone(),
             event_tx,
-            fetch_tx,
             ServerOptions {
                 smtp_enabled: true,
                 ..Default::default()
@@ -4356,12 +4333,10 @@ mod tests {
         });
 
         let (event_tx, _event_rx) = mpsc::channel(10);
-        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
         let app = build_router(
             Arc::new(settings),
             db.clone(),
             event_tx,
-            fetch_tx,
             ServerOptions {
                 smtp_enabled: true,
                 ..Default::default()
@@ -4514,12 +4489,10 @@ mod tests {
             .push("blocklisted@example.com".to_string());
 
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(10);
-        let (fetch_tx, _fetch_rx) = tokio::sync::mpsc::channel(10);
         let app = build_router(
             Arc::new(settings),
             db.clone(),
             event_tx,
-            fetch_tx,
             ServerOptions {
                 smtp_enabled: true,
                 ..Default::default()
@@ -4674,12 +4647,10 @@ mod tests {
             .push("maintainer@example.org".to_string());
 
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(10);
-        let (fetch_tx, _fetch_rx) = tokio::sync::mpsc::channel(10);
         let app = build_router(
             Arc::new(settings),
             db.clone(),
             event_tx,
-            fetch_tx,
             ServerOptions {
                 smtp_enabled: true,
                 ..Default::default()
@@ -4743,12 +4714,10 @@ mod tests {
             // not a revocation.
             settings.server.acl.blocklist = vec![" Blocked@Example.ORG ".to_string()];
             let (event_tx, _event_rx) = mpsc::channel(10);
-            let (fetch_tx, _fetch_rx) = mpsc::channel(10);
             Arc::new(AppState {
                 settings: Arc::new(settings),
                 db: db.clone(),
                 sender: event_tx,
-                fetch_sender: fetch_tx,
                 read_only: false,
                 forge_registry: Arc::new(crate::forge::ForgeRegistry::new()),
                 allow_all_submit,
@@ -4810,12 +4779,10 @@ mod tests {
             let mut settings = crate::settings::Settings::new().unwrap();
             settings.server.testing_mode = false;
             let (event_tx, _event_rx) = mpsc::channel(10);
-            let (fetch_tx, _fetch_rx) = mpsc::channel(10);
             Arc::new(AppState {
                 settings: Arc::new(settings),
                 db: db.clone(),
                 sender: event_tx,
-                fetch_sender: fetch_tx,
                 read_only: false,
                 forge_registry: Arc::new(crate::forge::ForgeRegistry::new()),
                 allow_all_submit: false,
@@ -4959,12 +4926,10 @@ mod tests {
         }
         let settings = Arc::new(crate::settings::Settings::new().unwrap());
         let (sender, _) = mpsc::channel(1);
-        let (fetch_sender, _) = mpsc::channel(1);
         let state = Arc::new(AppState {
             settings,
             db,
             sender,
-            fetch_sender,
             read_only: false,
             allow_all_submit: false,
             smtp_enabled: false,
@@ -5217,12 +5182,10 @@ mod tests {
         let settings = Arc::new(settings);
 
         let (event_tx, _event_rx) = mpsc::channel(10);
-        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
         let app = build_router(
             settings.clone(),
             db.clone(),
             event_tx,
-            fetch_tx,
             ServerOptions {
                 dry_run: true,
                 ..Default::default()
@@ -5533,12 +5496,10 @@ F:	net/
         let hb = Arc::new(std::sync::atomic::AtomicI64::new(now));
 
         let (event_tx, _event_rx) = mpsc::channel(10);
-        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
         let app = build_router(
             settings,
             db,
             event_tx,
-            fetch_tx,
             ServerOptions {
                 smtp_enabled: true,
                 email_worker_heartbeat: Some(hb.clone()),
@@ -5696,11 +5657,9 @@ F:	*
         let acl = &settings.server.acl;
 
         let (event_tx, _event_rx) = mpsc::channel(10);
-        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
         let state = Arc::new(AppState {
             db: db.clone(),
             sender: event_tx,
-            fetch_sender: fetch_tx,
             settings: settings.clone(),
             read_only: false,
             allow_all_submit: false,

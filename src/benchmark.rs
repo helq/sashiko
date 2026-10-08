@@ -16,7 +16,7 @@ use crate::ai::{AiProvider, LlmSession, SessionRunner, ValidationError, create_p
 use crate::baseline::CommitId;
 use crate::db::{AttributedSubsystem, Database, Severity};
 use crate::events::Event;
-use crate::fetcher::FetchAgent;
+use crate::fetcher::FetchWorker;
 use crate::project::ProjectId;
 use crate::reviewer::{Reviewer, WorkerSubprocessOverrides};
 use crate::settings::Settings;
@@ -703,7 +703,7 @@ async fn commit_has_completed_review(db: &Database, commit: &str) -> Result<bool
 }
 
 async fn ingest_benchmark_commits(
-    db: &Database,
+    db: &Arc<Database>,
     settings: &Settings,
     repo_override: Option<&str>,
     unique_commits: &[String],
@@ -730,56 +730,68 @@ async fn ingest_benchmark_commits(
     let repo_url = Some(repo_override.unwrap_or(DEFAULT_KERNEL_REPO_URL).to_string());
     let repo_path = PathBuf::from(&settings.git.repository_path);
     let (tx, mut rx) = mpsc::channel::<Event>(to_fetch.len().saturating_mul(2).max(32));
-    let (mut fetch_agent, _fetch_req_tx) =
-        FetchAgent::new(repo_path, tx, settings.forge.api_token.clone());
+    for sha in &to_fetch {
+        db.enqueue_fetch(None, None, repo_url.as_deref(), sha, None, None, None, 500)
+            .await?;
+    }
 
-    fetch_agent
-        .fetch_and_submit_batch(repo_url, to_fetch.clone())
-        .await;
-    drop(fetch_agent);
+    let fetch_worker = FetchWorker::new(
+        repo_path,
+        Arc::clone(db),
+        tx,
+        settings.forge.api_token.clone(),
+    );
+    let fetch_handle = tokio::spawn(async move {
+        fetch_worker.run().await;
+    });
 
     let mut ingested = 0usize;
     let mut failures = Vec::new();
-    while let Some(event) = rx.recv().await {
-        match event {
-            Event::PatchSubmitted {
-                article_id,
-                message_id,
-                subject,
-                author,
-                message,
-                diff,
-                base_commit,
-                timestamp,
-                index,
-                total,
-                ..
-            } => {
-                persist_benchmark_patch(
-                    db,
-                    &article_id,
-                    &message_id,
-                    &subject,
-                    &author,
-                    &message,
-                    &diff,
-                    base_commit.as_deref(),
+    while ingested + failures.len() < to_fetch.len() {
+        if let Some(event) = rx.recv().await {
+            match event {
+                Event::PatchSubmitted {
+                    article_id,
+                    message_id,
+                    subject,
+                    author,
+                    message,
+                    diff,
+                    base_commit,
                     timestamp,
                     index,
                     total,
-                )
-                .await?;
-                ingested += 1;
+                    ..
+                } => {
+                    persist_benchmark_patch(
+                        db,
+                        &article_id,
+                        &message_id,
+                        &subject,
+                        &author,
+                        &message,
+                        &diff,
+                        base_commit.as_deref(),
+                        timestamp,
+                        index,
+                        total,
+                    )
+                    .await?;
+                    ingested += 1;
+                }
+                Event::IngestionFailed {
+                    article_id, error, ..
+                } => {
+                    error!("Failed to ingest {}: {}", article_id, error);
+                    failures.push((article_id, error));
+                }
+                _ => {}
             }
-            Event::IngestionFailed {
-                article_id, error, ..
-            } => {
-                error!("Failed to ingest {}: {}", article_id, error);
-                failures.push((article_id, error));
-            }
-            _ => {}
+        } else {
+            break;
         }
     }
+    fetch_handle.abort();
 
     if !failures.is_empty() {
         bail!(
