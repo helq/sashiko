@@ -117,6 +117,16 @@ pub fn parse_commit_range_endpoints(spec: &str) -> Result<Vec<String>> {
     Ok(vec![start.to_string(), end.to_string()])
 }
 
+/// RAII guard that aborts a spawned Tokio task on drop.
+#[allow(dead_code)]
+struct TaskAbortGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for TaskAbortGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FetchRequest {
     pub repo_url: Option<String>,
