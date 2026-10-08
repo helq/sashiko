@@ -430,3 +430,59 @@ fn findings_empty(state: &CherryPickState) -> bool {
         .and_then(|v| v.as_array())
         .is_some_and(|a| a.is_empty())
 }
+
+// ---------------------------------------------------------------------------
+// Stage Validators & Feedback Formatters
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+fn validate_stages_1_to_7(val: &Value, _state: &CherryPickState) -> Result<(), String> {
+    let concerns = val
+        .get("concerns")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "JSON output is missing the required 'concerns' array".to_string())?;
+    for item in concerns {
+        if !item.is_object() {
+            return Err("Elements in 'concerns' array must be JSON objects".to_string());
+        }
+        if item
+            .get("description")
+            .and_then(Value::as_str)
+            .is_none_or(|s| s.trim().is_empty())
+        {
+            return Err(
+                "Each item in 'concerns' must have a non-empty 'description' string".to_string(),
+            );
+        }
+    }
+    let dismissed = val
+        .get("dismissed_concerns")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            "JSON output is missing the required 'dismissed_concerns' array".to_string()
+        })?;
+    for item in dismissed {
+        if !item.is_object() {
+            return Err("Elements in 'dismissed_concerns' array must be JSON objects".to_string());
+        }
+        if item
+            .get("description")
+            .and_then(Value::as_str)
+            .is_none_or(|s| s.trim().is_empty())
+        {
+            return Err(
+                "Each item in 'dismissed_concerns' must have a non-empty 'description' string"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn format_stage1_to_7_feedback(violation: &str) -> String {
+    format!(
+        "\n\nPrevious attempt was rejected: {}. You MUST return ONLY a JSON object containing 'concerns' and 'dismissed_concerns' arrays. If there are no concerns and no dismissed concerns, return `{{\"concerns\": [], \"dismissed_concerns\": []}}`.",
+        violation
+    )
+}
