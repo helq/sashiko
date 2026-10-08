@@ -1369,6 +1369,70 @@ pub struct ForgeOutboxRow {
     pub created_at: i64,
 }
 
+/// Status of an entry in the fetch queue.
+///
+/// Stored as TEXT in SQLite with a CHECK constraint limiting values
+/// to the three valid states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchStatus {
+    Pending,
+    Fetching,
+    Failed,
+}
+
+impl FetchStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "Pending",
+            Self::Fetching => "Fetching",
+            Self::Failed => "Failed",
+        }
+    }
+}
+
+impl std::fmt::Display for FetchStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for FetchStatus {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "Pending" => Ok(Self::Pending),
+            "Fetching" => Ok(Self::Fetching),
+            "Failed" => Ok(Self::Failed),
+            other => Err(anyhow::anyhow!("unknown FetchStatus: {}", other)),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FetchQueueRow {
+    pub id: i64,
+    pub patchset_id: Option<i64>,
+    pub cover_letter_message_id: Option<String>,
+    pub repo_url: Option<String>,
+    pub commit_hash: String,
+    pub mr_url: Option<String>,
+    pub mr_title: Option<String>,
+    pub mr_number: Option<i64>,
+    pub status: FetchStatus,
+    pub attempts: i64,
+    pub first_attempt_at: Option<i64>,
+    pub next_retry_at: Option<i64>,
+    pub locked_at: Option<i64>,
+    pub last_error: Option<String>,
+    pub priority: i64,
+    pub created_at: i64,
+    /// Extra commit SHAs that must be present locally for the review to hydrate
+    /// its context, but are never ingested as patches. Loaded from the
+    /// `fetch_supporting_commits` table. Used by cherry-pick reviews to carry
+    /// the original and base commits.
+    pub supporting_commits: Vec<String>,
+}
+
 #[cfg(feature = "server")]
 impl Database {
     pub fn has_bug_actor(&self) -> bool {
