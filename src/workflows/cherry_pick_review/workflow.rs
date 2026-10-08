@@ -158,6 +158,19 @@ async fn read_bounded_git_output(
 }
 
 #[allow(dead_code)]
+fn extract_resolution_diff(patchset: &Value) -> String {
+    patchset
+        .get("patches")
+        .and_then(|p| p.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|p| p.get("diff").and_then(|d| d.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
 async fn git_output(worktree: &Path, args: &[&str]) -> Option<String> {
     let child = match crate::git_cmd::in_dir_async(worktree)
         .kill_on_drop(true)
@@ -214,4 +227,19 @@ async fn git_output(worktree: &Path, args: &[&str]) -> Option<String> {
         );
         None
     }
+}
+
+#[allow(dead_code)]
+async fn git_subject(worktree: &Path, sha: &str) -> Option<String> {
+    git_output(
+        worktree,
+        &["show", "-s", "--format=%s", "--end-of-options", sha],
+    )
+    .await
+    .map(|s| s.trim().to_string())
+}
+
+#[allow(dead_code)]
+async fn git_show(worktree: &Path, sha: &str) -> Option<String> {
+    git_output(worktree, &["show", "--end-of-options", sha]).await
 }
