@@ -7338,6 +7338,13 @@ impl Database {
                         .await?;
                     }
 
+                    // Reassign fetch_queue entries before deleting merge_from_id
+                    tx.execute(
+                        "UPDATE fetch_queue SET patchset_id = ? WHERE patchset_id = ?",
+                        libsql::params![target_id, merge_from_id],
+                    )
+                    .await?;
+
                     // Delete the merged patchset
                     tx.execute(
                         "DELETE FROM patchsets WHERE id = ?",
