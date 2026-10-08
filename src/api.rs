@@ -206,6 +206,15 @@ pub enum SubmitRequest {
         skip_subjects: Option<Vec<String>>,
         only_subjects: Option<Vec<String>>,
     },
+    #[serde(rename = "cherry-pick")]
+    CherryPick {
+        sha: String,
+        original_sha: String,
+        base_sha: Option<String>,
+        repo: Option<String>,
+        skip_subjects: Option<Vec<String>>,
+        only_subjects: Option<Vec<String>>,
+    },
     Thread {
         msgid: String,
     },

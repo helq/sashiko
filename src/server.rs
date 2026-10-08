@@ -19,6 +19,7 @@ use crate::db::Database;
 use crate::events::{Event, MessageSource};
 use crate::fetcher::FetchRequest;
 use crate::mbox::LoreMboxClient;
+use crate::review_kind::ReviewKind;
 use axum::{
     Json, Router,
     extract::{ConnectInfo, Path, Query, Request, State},
@@ -424,6 +425,13 @@ fn generate_synthetic_id(prefix: &str) -> String {
     )
 }
 
+fn is_valid_git_ref(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with('-')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | '~' | '^'))
+}
+
 async fn submit_patch(
     auth: crate::auth::OptionalAuthUser,
     // Logged on a refusal to give an operator something to grep for. It is
@@ -590,6 +598,55 @@ async fn submit_patch(
                 status: "accepted".to_string(),
                 id,
             }))
+        }
+        SubmitRequest::CherryPick {
+            sha,
+            original_sha,
+            base_sha,
+            repo: _,
+            skip_subjects: _,
+            only_subjects: _,
+        } => {
+            if !is_valid_git_ref(&sha)
+                || !is_valid_git_ref(&original_sha)
+                || base_sha.as_deref().is_some_and(|b| !is_valid_git_ref(b))
+            {
+                warn!(
+                    "rejected cherry-pick submit request with invalid git ref: sha={:?}, original={:?}, base={:?}",
+                    sha, original_sha, base_sha
+                );
+                return Err(StatusCode::BAD_REQUEST.into_response());
+            }
+
+            if original_sha == sha {
+                warn!(
+                    "rejected cherry-pick submit request where original and resolution SHA match: {}",
+                    sha
+                );
+                return Err(StatusCode::BAD_REQUEST.into_response());
+            }
+
+            if base_sha.as_deref().is_some_and(|b| b == sha) {
+                warn!(
+                    "rejected cherry-pick submit request where base and resolution SHA match: {}",
+                    sha
+                );
+                return Err(StatusCode::BAD_REQUEST.into_response());
+            }
+
+            let review_kind = ReviewKind::CherryPick {
+                original_sha: original_sha.clone(),
+                base_sha: base_sha.clone(),
+            };
+            let _review_context_json = match serde_json::to_string(&review_kind) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("Failed to serialize review context: {}", e);
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                }
+            };
+
+            Err(StatusCode::NOT_IMPLEMENTED.into_response())
         }
         SubmitRequest::Thread { msgid } => {
             let id = generate_synthetic_id("thread");
