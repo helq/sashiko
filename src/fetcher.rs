@@ -383,6 +383,9 @@ impl FetchAgent {
     }
 
     async fn ensure_remote(&self, name: &str, url: &str) -> Result<()> {
+        let global_lock = crate::git_ops::get_global_config_lock();
+        let _global_guard = global_lock.lock().await;
+
         // Inject GitLab token via parsed url::Url to prevent parser differentials.
         let authenticated_url = if let Some(token) = &self.gitlab_token {
             if let Ok(mut parsed) = url::Url::parse(url)
@@ -460,22 +463,32 @@ impl FetchAgent {
         Ok(())
     }
 
+    /// Base `git fetch` command shared by all fetches: no interactive prompt,
+    /// the standard protocol restrictions, and `kill_on_drop` so a cancelled
+    /// fetch is reaped. Callers append fetch flags, the remote, and revisions.
+    ///
+    /// Note: protocol v2 is deliberately NOT forced here. Protocol v1 sends
+    /// all remote refs upfront, giving the client rich negotiation data that
+    /// avoids pathological full-repo downloads for unreachable SHAs.
+    fn fetch_base_cmd(&self) -> tokio::process::Command {
+        let mut cmd = crate::git_cmd::in_dir_async(&self.repo_path);
+        cmd.args(["-c", "safe.bareRepository=all"])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .args(crate::git_ops::GIT_PROTOCOL_RESTRICTIONS)
+            .arg("fetch")
+            .kill_on_drop(true);
+        cmd
+    }
+
     /// Runs one `git fetch`, dropping a stale commit-graph and trying
-    /// again when that is what turned the fetch away.  Fetch-pack
-    /// rejects the graph before it opens a connection, so that retry
-    /// repeats no transfer; the wording the commit parse emits can
-    /// come after one, and then the retry pays for it again.  Returns
-    /// git's own output either way; the caller words the failure.
+    /// again when that is what turned the fetch away.
     async fn fetch_with_graph_retry(&self, args: &[&str]) -> Result<Output> {
         let mut dropped_graph = false;
 
         loop {
-            let output = crate::git_cmd::in_dir_async(&self.repo_path)
-                .args(crate::git_ops::GIT_PROTOCOL_RESTRICTIONS)
-                .arg("fetch")
-                .args(args)
-                .output()
-                .await?;
+            let mut cmd = self.fetch_base_cmd();
+            cmd.args(args);
+            let output = cmd.output().await?;
 
             if output.status.success() || dropped_graph {
                 if dropped_graph {
