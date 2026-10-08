@@ -817,6 +817,54 @@ async fn run_daemon(
                 let count = stuck.len();
                 for p in stuck {
                     seen_placeholder_ids.insert(p.patchset_id);
+                    let Some(cover) = p.cover_letter_message_id.as_deref() else {
+                        warn!(
+                            "Orphaned patchset {} has no cover_letter_message_id; marking Failed",
+                            p.patchset_id
+                        );
+                        if let Err(e) = db
+                            .conn
+                            .execute(
+                                "UPDATE patchsets SET status = 'Failed', failed_reason = ? WHERE id = ?",
+                                libsql::params![
+                                    "Missing cover_letter_message_id during startup recovery",
+                                    p.patchset_id
+                                ],
+                            )
+                            .await
+                        {
+                            error!("Failed to update orphan patchset status: {}", e);
+                        }
+                        continue;
+                    };
+                    let commit = sashiko::fetcher::commit_hash_from_placeholder(cover);
+                    if let Err(e) = db
+                        .enqueue_fetch(
+                            Some(p.patchset_id),
+                            Some(cover),
+                            p.repo_url.as_deref(),
+                            &commit,
+                            p.mr_url.as_deref(),
+                            p.mr_title.as_deref(),
+                            p.mr_number,
+                            p.priority as i32,
+                        )
+                        .await
+                    {
+                        error!(
+                            "Failed to backfill fetch for patchset {}: {}",
+                            p.patchset_id, e
+                        );
+                        if let Err(err) = db
+                            .update_patchset_error(
+                                cover,
+                                &format!("Failed to enqueue fetch during startup recovery: {}", e),
+                            )
+                            .await
+                        {
+                            error!("Failed to update orphan patchset status: {}", err);
+                        }
+                    }
                 }
                 if count < 100 {
                     break;
