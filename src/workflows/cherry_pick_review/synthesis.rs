@@ -35,7 +35,6 @@ fn dismissed_json(state: &CherryPickState) -> String {
     serde_json::to_string_pretty(&state.dismissed_concerns).unwrap_or_default()
 }
 
-#[allow(dead_code)]
 fn findings_json(state: &CherryPickState) -> String {
     match &state.findings {
         Some(v) => serde_json::to_string_pretty(v).unwrap_or_default(),
@@ -163,6 +162,40 @@ Example Output:
 }}
 ```"#,
             stage_prompt, deduplicated_concerns_json, deduplicated_dismissed_concerns_json
+        );
+        (user_prompt.clone(), user_prompt)
+    })
+}
+
+pub fn stage10_builder() -> StagePromptBuilder {
+    Box::new(|stage_prompt: &str, state: &CherryPickState| {
+        let full_series_context = "Not applicable (single patch or last patch in series).";
+        let conflict_resolved_concerns_json = concerns_json(state);
+        let user_prompt = format!(
+            "{}\n\nCRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must find concrete evidence in the code that proves the concern is invalid (e.g., verifying the caller handles the edge case). If you cannot find concrete proof of safety, you must retain the concern.\n\nFull Series Context:\n{}\n\nConsolidated Concerns:\n{}\n\nReturn ONLY a JSON object with a 'findings' array. Each object in the 'findings' array MUST use exactly the following keys: \"problem\" (a string containing the vulnerability description), \"severity\" (a string: Low, Medium, High, or Critical), \"severity_explanation\" (a string detailing the reasoning and proof), \"locations\" (an array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters). Carry forward the locations from the validated concern; if you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown.\n\nExample Output:\n```json\n{{\n  \"findings\": [\n    {{\n      \"problem\": \"Memory leak in function X when condition Y is met.\",\n      \"severity\": \"High\",\n      \"severity_explanation\": \"1. Condition Y is met.\\n2. The buffer is allocated but not freed before return.\",\n      \"locations\": [\n        {{\n          \"file\": \"path/to/file.c\",\n          \"function_or_symbol\": \"function_name\",\n          \"line\": 123,\n          \"code_snippet\": \"problematic_code();\",\n          \"why_this_location_matters\": \"This is where the newly allocated resource is dropped on the error path.\"\n        }}\n      ]\n    }}\n  ]\n}}\n```",
+            stage_prompt, full_series_context, conflict_resolved_concerns_json
+        );
+        (user_prompt.clone(), user_prompt)
+    })
+}
+
+pub fn origin_builder() -> StagePromptBuilder {
+    Box::new(|classification_prompt: &str, state: &CherryPickState| {
+        let findings_str = findings_json(state);
+        let user_prompt = format!(
+            "{}\n\nFindings to classify:\n{}\n\nReturn ONLY a JSON object with a 'findings' array. Each finding must have all original fields plus an 'origin' field.",
+            classification_prompt, findings_str
+        );
+        (user_prompt.clone(), user_prompt)
+    })
+}
+
+pub fn stage11_builder() -> StagePromptBuilder {
+    Box::new(|stage_prompt: &str, state: &CherryPickState| {
+        let findings_str = findings_json(state);
+        let user_prompt = format!(
+            "{}\n\nFindings:\n{}\n\nReturn raw text output, not JSON.",
+            stage_prompt, findings_str
         );
         (user_prompt.clone(), user_prompt)
     })
