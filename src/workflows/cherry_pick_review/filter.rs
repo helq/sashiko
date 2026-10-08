@@ -34,13 +34,149 @@ pub fn filter_cherry_pick_findings(findings: &serde_json::Value) -> serde_json::
         }
     };
 
-    serde_json::json!(arr)
+    let filtered: Vec<serde_json::Value> = arr
+        .iter()
+        .filter(|f| {
+            let severity = f
+                .get("severity")
+                .and_then(|v| v.as_str())
+                .unwrap_or("medium")
+                .to_lowercase();
+            let origin = f
+                .get("origin")
+                .and_then(|v| v.as_str())
+                .unwrap_or("resolution_introduced")
+                .to_lowercase();
+
+            // Drop all low severity.
+            if severity == "low" {
+                tracing::info!(
+                    "Filtering out low-severity finding: {}",
+                    f.get("problem")
+                        .or_else(|| f.get("description"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?")
+                );
+                return false;
+            }
+
+            // Drop all findings pre-existing in the target base branch.
+            if origin == "base_preexisting" {
+                tracing::info!(
+                    "Filtering out base-preexisting finding: {}",
+                    f.get("problem")
+                        .or_else(|| f.get("description"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?")
+                );
+                return false;
+            }
+
+            // Drop findings pre-existing in the original patch unless critical.
+            if origin == "original_patch_preexisting" && severity != "critical" {
+                tracing::info!(
+                    "Filtering out original-patch-preexisting ({}) finding: {}",
+                    severity,
+                    f.get("problem")
+                        .or_else(|| f.get("description"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?")
+                );
+                return false;
+            }
+
+            true
+        })
+        .cloned()
+        .collect();
+
+    serde_json::json!(filtered)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn descriptions(v: &serde_json::Value) -> Vec<String> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["description"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn keeps_resolution_introduced_medium_plus() {
+        let findings = json!([
+            {"description": "keep-me", "severity": "high", "origin": "resolution_introduced"},
+            {"description": "keep-me-2", "severity": "medium", "origin": "resolution_introduced"},
+        ]);
+        let out = filter_cherry_pick_findings(&findings);
+        assert_eq!(descriptions(&out), vec!["keep-me", "keep-me-2"]);
+    }
+
+    #[test]
+    fn drops_low_severity_regardless_of_origin() {
+        let findings = json!([
+            {"description": "low", "severity": "low", "origin": "resolution_introduced"},
+        ]);
+        assert_eq!(
+            filter_cherry_pick_findings(&findings)
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn drops_base_preexisting_even_when_critical() {
+        let findings = json!([
+            {"description": "base", "severity": "critical", "origin": "base_preexisting"},
+        ]);
+        assert_eq!(
+            filter_cherry_pick_findings(&findings)
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn drops_original_preexisting_unless_critical() {
+        let findings = json!([
+            {"description": "orig-high", "severity": "high", "origin": "original_patch_preexisting"},
+            {"description": "orig-crit", "severity": "critical", "origin": "original_patch_preexisting"},
+        ]);
+        assert_eq!(
+            descriptions(&filter_cherry_pick_findings(&findings)),
+            vec!["orig-crit"]
+        );
+    }
+
+    #[test]
+    fn defaults_missing_origin_to_resolution_introduced() {
+        let findings = json!([
+            {"description": "no-origin", "severity": "high"},
+        ]);
+        assert_eq!(
+            descriptions(&filter_cherry_pick_findings(&findings)),
+            vec!["no-origin"]
+        );
+    }
+
+    #[test]
+    fn defaults_missing_severity_to_medium() {
+        let findings = json!([
+            {"description": "no-severity", "origin": "resolution_introduced"},
+        ]);
+        assert_eq!(
+            descriptions(&filter_cherry_pick_findings(&findings)),
+            vec!["no-severity"]
+        );
+    }
 
     #[test]
     fn non_array_preserved() {
