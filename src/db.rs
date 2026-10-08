@@ -9793,12 +9793,46 @@ impl Database {
         mr_number: Option<i64>,
         priority: i32,
     ) -> Result<()> {
+        self.enqueue_fetch_with_support(
+            patchset_id,
+            cover_letter_message_id,
+            repo_url,
+            commit_hash,
+            mr_url,
+            mr_title,
+            mr_number,
+            priority,
+            &[],
+        )
+        .await
+    }
+
+    /// Like `enqueue_fetch`, but also records `supporting_commits`: extra commit
+    /// SHAs the worker must ensure are present locally (e.g. the original and
+    /// base commits of a cherry-pick) without ingesting them as patches. Only
+    /// `commit_hash` is ingested; the supporting commits are fetched purely so
+    /// downstream reviews (like the cherry-pick pipeline) can hydrate their full
+    /// context from git.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn enqueue_fetch_with_support(
+        &self,
+        patchset_id: Option<i64>,
+        cover_letter_message_id: Option<&str>,
+        repo_url: Option<&str>,
+        commit_hash: &str,
+        mr_url: Option<&str>,
+        mr_title: Option<&str>,
+        mr_number: Option<i64>,
+        priority: i32,
+        supporting_commits: &[String],
+    ) -> Result<()> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs() as i64;
 
-        self.conn
-            .execute(
+        let tx = self.begin_immediate_transaction().await?;
+        let mut rows = tx
+            .query(
                 "INSERT INTO fetch_queue ( \
                      patchset_id, cover_letter_message_id, repo_url, commit_hash, \
                      mr_url, mr_title, mr_number, status, attempts, priority, created_at \
@@ -9810,7 +9844,8 @@ impl Database {
                        AND IFNULL(repo_url, '') = IFNULL(?, '') \
                        AND IFNULL(cover_letter_message_id, '') = IFNULL(?, '') \
                        AND status IN ('Pending', 'Fetching') \
-                 )",
+                 ) \
+                 RETURNING id",
                 libsql::params![
                     patchset_id,
                     cover_letter_message_id,
@@ -9827,6 +9862,23 @@ impl Database {
                 ],
             )
             .await?;
+        let fetch_id: i64 = match rows.next().await? {
+            Some(row) => row.get(0)?,
+            None => return Ok(()),
+        };
+        drop(rows);
+
+        // Record each supporting commit as its own row (1-to-N) so an arbitrary
+        // number can be stored without packing them into a single column.
+        for sha in supporting_commits {
+            tx.execute(
+                "INSERT INTO fetch_supporting_commits (fetch_id, commit_hash) \
+                 VALUES (?, ?)",
+                libsql::params![fetch_id, sha.as_str()],
+            )
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
