@@ -23,11 +23,12 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::ai::AiProvider;
 use crate::toolbox::ToolBox;
 use crate::worker::prompts::PromptRegistry;
+use crate::workflow::RecitationPolicy;
 
 /// Declarative workflow definition for reviewing cherry-pick conflict resolutions.
 #[derive(Debug, Clone)]
@@ -391,4 +392,41 @@ async fn git_subject(worktree: &Path, sha: &str) -> Option<String> {
 
 async fn git_show(worktree: &Path, sha: &str) -> Option<String> {
     git_output(worktree, &["show", "--end-of-options", sha]).await
+}
+
+#[allow(dead_code)]
+fn recitation_reminder() -> RecitationPolicy {
+    RecitationPolicy::RetryWithReminder(
+        "IMPORTANT: Your previous response was blocked by a recitation filter. \
+         Do NOT copy multi-line blocks of code verbatim in your JSON fields. \
+         Summarize the relevant code in your own words and keep any code_snippet \
+         field to a single short identifier or line while still returning valid \
+         JSON matching the required schema."
+            .to_string(),
+    )
+}
+
+#[allow(dead_code)]
+fn tag_source(item: Value, stage: u8) -> Option<Value> {
+    match item {
+        Value::Object(mut map) => {
+            map.insert("source_stage".to_string(), json!(stage));
+            Some(Value::Object(map))
+        }
+        Value::String(text) => Some(json!({
+            "source_stage": stage,
+            "type": "General",
+            "description": text,
+        })),
+        _ => None,
+    }
+}
+
+#[allow(dead_code)]
+fn findings_empty(state: &CherryPickState) -> bool {
+    state
+        .findings
+        .as_ref()
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| a.is_empty())
 }
