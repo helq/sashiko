@@ -566,3 +566,53 @@ fn format_stage9_feedback(violation: &str) -> String {
         violation
     )
 }
+
+#[allow(dead_code)]
+fn validate_stage10(val: &Value, _state: &CherryPickState) -> Result<(), String> {
+    let arr = match val.get("findings").and_then(|f| f.as_array()) {
+        Some(a) => a,
+        None => return Err("missing 'findings' array in output".to_string()),
+    };
+    for finding in arr {
+        let sev = match finding.get("severity").and_then(|v| v.as_str()) {
+            Some(s) => s.to_lowercase(),
+            None => return Err("missing or invalid 'severity' field in finding".to_string()),
+        };
+        if !matches!(sev.as_str(), "low" | "medium" | "high" | "critical") {
+            return Err("missing or invalid 'severity' field in finding".to_string());
+        }
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn validate_stage_origin(val: &Value, state: &CherryPickState) -> Result<(), String> {
+    validate_stage10(val, state)?;
+    let arr = val.get("findings").and_then(|f| f.as_array()).unwrap();
+    for finding in arr {
+        let origin = match finding.get("origin").and_then(|v| v.as_str()) {
+            Some(o) => o.to_lowercase(),
+            None => return Err("missing or invalid 'origin' field in finding".to_string()),
+        };
+        if !matches!(
+            origin.as_str(),
+            "resolution_introduced" | "original_patch_preexisting" | "base_preexisting"
+        ) {
+            return Err("missing or invalid 'origin' field in finding".to_string());
+        }
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn format_stage_origin_feedback(violation: &str) -> String {
+    let msg = if violation.starts_with("Failed to parse JSON from output:") {
+        "missing 'findings' array in output"
+    } else {
+        violation
+    };
+    format!(
+        "\n\nPrevious attempt was rejected: {}. You MUST return ONLY a JSON object containing 'findings' array.",
+        msg
+    )
+}
