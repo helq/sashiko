@@ -122,6 +122,14 @@ enum Commands {
         /// Only review patches matching subject pattern (with wildcards, e.g. *PRODKERNEL*)
         #[arg(long, value_name = "PATTERN")]
         only_subject: Option<Vec<String>>,
+
+        /// Original commit SHA before backport / cherry-pick
+        #[arg(long)]
+        original_sha: Option<String>,
+
+        /// Base commit SHA before resolution
+        #[arg(long)]
+        base_sha: Option<String>,
     },
     /// Show server status and statistics
     Status,
@@ -220,6 +228,10 @@ enum Commands {
         /// Output concise machine-friendly JSON for AI agents and skip plain-text report generation
         #[arg(long)]
         agent: bool,
+
+        /// Alternate review workflow selector as JSON (e.g. cherry-pick review context)
+        #[arg(long)]
+        review_context: Option<String>,
     },
     /// Query and triage bugs in the Sashiko bug repository
     Bugs {
@@ -307,7 +319,7 @@ enum TokenCommands {
     },
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
 enum SubmitType {
     /// Submit a raw mbox file (or - for stdin)
     Mbox,
@@ -317,6 +329,9 @@ enum SubmitType {
     Range,
     /// Fetch a thread from lore.kernel.org by message ID
     Thread,
+    /// Submit an automated cherry-pick / merge conflict resolution
+    #[value(name = "cherry-pick")]
+    CherryPick,
 }
 
 #[tokio::main]
@@ -454,6 +469,8 @@ async fn run_command(
             baseline,
             skip_subject,
             only_subject,
+            original_sha,
+            base_sha,
         } => {
             handle_submit(
                 client,
@@ -464,6 +481,8 @@ async fn run_command(
                 baseline,
                 skip_subject,
                 only_subject,
+                original_sha,
+                base_sha,
                 format,
             )
             .await
@@ -505,6 +524,7 @@ async fn run_command(
             force_local,
             interactive,
             agent,
+            review_context,
         } => {
             handle_local(
                 client,
@@ -517,6 +537,7 @@ async fn run_command(
                 force_local,
                 interactive,
                 agent,
+                review_context,
                 format,
             )
             .await
@@ -798,13 +819,21 @@ async fn handle_submit(
     baseline: Option<String>,
     skip_subjects: Option<Vec<String>>,
     only_subjects: Option<Vec<String>>,
+    original_sha: Option<String>,
+    base_sha: Option<String>,
     format: OutputFormat,
 ) -> Result<()> {
     let url = format!("{}/api/submit", base_url);
 
-    // DWIM Detection Logic
     let (submission_type, target) = if let Some(t) = explicit_type {
         (t, input.unwrap_or_else(|| "HEAD".to_string()))
+    } else if original_sha.is_some() {
+        (
+            SubmitType::CherryPick,
+            input.unwrap_or_else(|| "HEAD".to_string()),
+        )
+    } else if base_sha.is_some() {
+        anyhow::bail!("--base-sha requires --original-sha");
     } else {
         // Auto-detect based on input
         if let Some(s) = input {
@@ -843,6 +872,12 @@ async fn handle_submit(
         }
     };
 
+    if !matches!(submission_type, SubmitType::CherryPick)
+        && (original_sha.is_some() || base_sha.is_some())
+    {
+        anyhow::bail!("--original-sha and --base-sha can only be used with --type cherry-pick");
+    }
+
     let payload = match submission_type {
         SubmitType::Mbox => {
             let raw_bytes = if target == "-" {
@@ -879,6 +914,21 @@ async fn handle_submit(
 
             SubmitRequest::RemoteRange {
                 sha: target,
+                repo: repo_path,
+                skip_subjects: skip_subjects.clone(),
+                only_subjects: only_subjects.clone(),
+            }
+        }
+        SubmitType::CherryPick => {
+            let orig = original_sha.ok_or_else(|| {
+                anyhow::anyhow!("--original-sha is required when submitting a cherry-pick review")
+            })?;
+            let repo_path = repo.map(|p| p.to_string_lossy().to_string());
+
+            SubmitRequest::CherryPick {
+                sha: target,
+                original_sha: orig,
+                base_sha,
                 repo: repo_path,
                 skip_subjects: skip_subjects.clone(),
                 only_subjects: only_subjects.clone(),
@@ -1976,6 +2026,7 @@ async fn handle_local(
     force_local: bool,
     interactive: bool,
     agent: bool,
+    review_context: Option<String>,
     format: OutputFormat,
 ) -> Result<()> {
     // Determine repository path
@@ -1992,9 +2043,10 @@ async fn handle_local(
         cwd
     };
 
-    // Check if server is running (unless --force-local or --agent)
+    // Check if server is running (unless --force-local, --agent, or --review-context is specified)
     if !force_local
         && !agent
+        && review_context.is_none()
         && let Ok(settings) = Settings::new()
     {
         let addr = format!("{}:{}", settings.server.host, settings.server.port);
@@ -2125,6 +2177,10 @@ async fn handle_local(
         if let Some(prompt) = &dynamic_prompt {
             args.push("--custom-prompt".to_string());
             args.push(prompt.clone());
+        }
+        if let Some(rc) = &review_context {
+            args.push("--review-context".to_string());
+            args.push(rc.clone());
         }
 
         eprint_phase(2, 4, "Starting review subprocess...");
@@ -2863,5 +2919,103 @@ diff --git a/f b/f\n\
 
         let err = prepare_mbox_payload(mbox_raw.to_vec()).unwrap_err();
         assert!(err.to_string().contains("contains invalid non-UTF-8 bytes"));
+    }
+
+    #[test]
+    fn test_cli_submit_and_local_cherry_pick_parsing() {
+        let parsed = Cli::try_parse_from([
+            "sashiko-cli",
+            "submit",
+            "--type",
+            "cherry-pick",
+            "--original-sha",
+            "deadbeef1",
+            "--base-sha",
+            "deadbeef2",
+            "deadbeef3",
+        ])
+        .unwrap();
+        match parsed.command {
+            Commands::Submit {
+                r#type,
+                original_sha,
+                base_sha,
+                input,
+                ..
+            } => {
+                assert_eq!(r#type, Some(SubmitType::CherryPick));
+                assert_eq!(original_sha.as_deref(), Some("deadbeef1"));
+                assert_eq!(base_sha.as_deref(), Some("deadbeef2"));
+                assert_eq!(input.as_deref(), Some("deadbeef3"));
+            }
+            _ => panic!("Expected Submit command"),
+        }
+
+        let local_parsed = Cli::try_parse_from([
+            "sashiko-cli",
+            "local",
+            "--review-context",
+            r#"{"kind":"cherry-pick"}"#,
+            "deadbeef",
+        ])
+        .unwrap();
+        match local_parsed.command {
+            Commands::Local {
+                review_context,
+                input,
+                ..
+            } => {
+                assert_eq!(review_context.as_deref(), Some(r#"{"kind":"cherry-pick"}"#));
+                assert_eq!(input, "deadbeef");
+            }
+            _ => panic!("Expected Local command"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_submit_base_sha_without_original_sha_or_type_fails() {
+        let client = reqwest::Client::new();
+        let err = handle_submit(
+            &client,
+            "http://127.0.0.1:0",
+            Some("commit-sha".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("base-sha".to_string()),
+            OutputFormat::Text,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.to_string(), "--base-sha requires --original-sha");
+    }
+
+    #[tokio::test]
+    async fn test_submit_rejects_original_or_base_sha_for_non_cherry_pick() {
+        let client = reqwest::Client::new();
+        let err = handle_submit(
+            &client,
+            "http://127.0.0.1:0",
+            Some("commit-sha".to_string()),
+            Some(SubmitType::Mbox),
+            None,
+            None,
+            None,
+            None,
+            Some("orig-sha".to_string()),
+            None,
+            OutputFormat::Text,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "--original-sha and --base-sha can only be used with --type cherry-pick"
+        );
     }
 }
