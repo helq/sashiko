@@ -30,52 +30,46 @@ use crate::toolbox::ToolBox;
 use crate::worker::prompts::PromptRegistry;
 use crate::workflow::RecitationPolicy;
 
-/// Declarative workflow definition for reviewing cherry-pick conflict resolutions.
-#[derive(Debug, Clone)]
+/// A cherry-pick / merge-conflict resolution review workflow.
+#[derive(Clone, Debug)]
 pub struct CherryPickReviewWorkflow {
+    /// SHA of the original patch being ported (commit 1).
     pub original_sha: String,
+    /// SHA of the target base branch the patch was applied onto (commit 2).
     pub base_sha: Option<String>,
+    /// SHA of the resolution commit under review (commit 3).
     pub resolution_sha: String,
-    pub stages: Option<Vec<String>>,
 }
 
 impl CherryPickReviewWorkflow {
-    pub fn new(original_sha: impl Into<String>, resolution_sha: impl Into<String>) -> Self {
-        Self {
-            original_sha: original_sha.into(),
-            base_sha: None,
-            resolution_sha: resolution_sha.into(),
-            stages: None,
-        }
-    }
-
-    pub fn from_review_kind(
-        kind: &crate::review_kind::ReviewKind,
+    /// Create a new cherry-pick review workflow.
+    pub fn new(
+        original_sha: impl Into<String>,
+        base_sha: Option<String>,
         resolution_sha: impl Into<String>,
     ) -> Self {
-        match kind {
-            crate::review_kind::ReviewKind::CherryPick {
-                original_sha,
-                base_sha,
-            } => Self {
-                original_sha: original_sha.clone(),
-                base_sha: base_sha.clone(),
-                resolution_sha: resolution_sha.into(),
-                stages: None,
-            },
+        Self {
+            original_sha: original_sha.into(),
+            base_sha,
+            resolution_sha: resolution_sha.into(),
         }
     }
 
-    pub fn with_base_sha(mut self, base_sha: impl Into<String>) -> Self {
-        self.base_sha = Some(base_sha.into());
-        self
+    /// Build the workflow from the persisted review context and resolution SHA.
+    pub fn from_review_kind(kind: &crate::review_kind::ReviewKind, resolution_sha: String) -> Self {
+        let crate::review_kind::ReviewKind::CherryPick {
+            original_sha,
+            base_sha,
+        } = kind;
+        Self {
+            original_sha: original_sha.clone(),
+            base_sha: base_sha.clone(),
+            resolution_sha,
+        }
     }
+}
 
-    pub fn with_stages(mut self, stages: Option<Vec<String>>) -> Self {
-        self.stages = stages;
-        self
-    }
-
+impl CherryPickReviewWorkflow {
     #[allow(dead_code)]
     async fn build_initial_state(
         &self,
