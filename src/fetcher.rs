@@ -303,9 +303,7 @@ impl FetchAgent {
                         .insert(req.commit_hash);
                 }
                 _ = ticker.tick() => {
-                    if !queue.is_empty() {
-                        self.process_queue(&mut queue).await;
-                    }
+                    queue.clear();
                 }
             }
         }
@@ -320,7 +318,10 @@ impl FetchAgent {
     async fn process_queue(&self, queue: &mut HashMap<Option<String>, HashSet<String>>) {
         let _ = queue.drain();
     }
+}
 
+#[allow(dead_code)]
+impl FetchWorker {
     fn get_remote_name(&self, url: &str) -> String {
         // Use a hash of the URL to ensure safe and unique remote names
         use std::collections::hash_map::DefaultHasher;
@@ -550,15 +551,28 @@ impl FetchAgent {
     }
 
     async fn is_present(&self, commit_or_range: &str) -> bool {
+        let commit_or_range = commit_or_range.trim();
+        if commit_or_range.starts_with('-') {
+            return false;
+        }
         let mut args = vec!["-c", "safe.bareRepository=all"];
         let arg_str: String;
 
         if let Some((start, end)) = commit_or_range.split_once("..") {
-            arg_str = format!("{}^{{commit}}..{}^{{commit}}", start, end);
-            args.extend(["rev-list", "-n", "1", &arg_str]);
+            if start.trim().starts_with('-') || end.trim().starts_with('-') {
+                return false;
+            }
+            arg_str = format!("{}^{{commit}}..{}^{{commit}}", start.trim(), end.trim());
+            args.extend(["rev-list", "-n", "1", "--end-of-options", &arg_str]);
         } else {
             arg_str = format!("{}^{{commit}}", commit_or_range);
-            args.extend(["rev-parse", "--verify", &arg_str]);
+            args.extend([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                &arg_str,
+            ]);
         };
 
         let output = crate::git_cmd::in_dir_async(&self.repo_path)
@@ -589,9 +603,24 @@ impl FetchAgent {
 
     #[allow(dead_code)]
     async fn resolve_sha(&self, commit: &str) -> Result<String> {
+        let commit = commit.trim();
+        if commit.starts_with('-') {
+            return Err(PermanentFetchError(format!(
+                "Invalid commit reference starting with '-': {}",
+                commit
+            ))
+            .into());
+        }
+        let arg_str = format!("{}^{{commit}}", commit);
         let output = crate::git_cmd::in_dir_async(&self.repo_path)
             .args(["-c", "safe.bareRepository=all"])
-            .args(["rev-parse", "--verify", commit])
+            .args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                &arg_str,
+            ])
             .output()
             .await?;
 
@@ -644,11 +673,21 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
 
-    #[tokio::test]
-    async fn test_fetch_agent_lifecycle() {
+    async fn test_worker(repo_path: PathBuf) -> FetchWorker {
+        let settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Arc::new(Database::new(&settings).await.unwrap());
+        db.migrate().await.unwrap();
         let (tx, _rx) = mpsc::channel(1);
-        let repo_path = PathBuf::from("/tmp");
-        let (_agent, _sender) = FetchAgent::new(repo_path, tx, None);
+        FetchWorker::new(repo_path, db, tx, None)
+    }
+
+    #[tokio::test]
+    async fn test_fetch_worker_construction() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _worker = test_worker(temp_dir.path().to_path_buf()).await;
     }
 
     #[tokio::test]
@@ -683,8 +722,7 @@ mod tests {
             .output()
             .await?;
 
-        let (tx, _rx) = mpsc::channel(1);
-        let (agent, _) = FetchAgent::new(repo_path.clone(), tx, None);
+        let worker = test_worker(repo_path.clone()).await;
 
         let output = crate::git_cmd::in_dir_async(&repo_path)
             .args(["rev-parse", "HEAD"])
@@ -692,7 +730,7 @@ mod tests {
             .await?;
         let head = String::from_utf8(output.stdout)?.trim().to_string();
 
-        let event = agent
+        let event = worker
             .extract_patch(&head, &head, 1, 1, None, None, None)
             .await?;
 
@@ -749,8 +787,7 @@ mod tests {
             .output()
             .await?;
 
-        let (tx, _rx) = mpsc::channel(1);
-        let (agent, _) = FetchAgent::new(repo_path.clone(), tx, None);
+        let worker = test_worker(repo_path.clone()).await;
 
         let output = crate::git_cmd::in_dir_async(&repo_path)
             .args(["rev-parse", "HEAD^{tree}"])
@@ -759,7 +796,7 @@ mod tests {
         let tree_sha = String::from_utf8(output.stdout)?.trim().to_string();
 
         assert!(
-            !agent.is_present(&tree_sha).await,
+            !worker.is_present(&tree_sha).await,
             "Tree SHA should not be considered a present commit"
         );
 
@@ -770,7 +807,7 @@ mod tests {
         let commit_sha = String::from_utf8(output.stdout)?.trim().to_string();
 
         assert!(
-            agent.is_present(&commit_sha).await,
+            worker.is_present(&commit_sha).await,
             "Commit SHA should be considered present"
         );
 
@@ -887,5 +924,88 @@ mod tests {
         let err: anyhow::Error = PermanentFetchError("fatal error".to_string()).into();
         let wrapped = err.context("extract failed");
         assert!(wrapped.chain().any(|e| e.is::<PermanentFetchError>()));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_sha_leading_dash_rejected() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let repo_path = temp_dir.path().to_path_buf();
+        crate::git_cmd::in_dir_async(&repo_path)
+            .args(["init", "-b", "main"])
+            .output()
+            .await?;
+
+        let worker = test_worker(repo_path).await;
+        let err = worker.resolve_sha("--all").await.unwrap_err();
+        assert!(
+            err.downcast_ref::<PermanentFetchError>().is_some(),
+            "Expected PermanentFetchError, got: {:?}",
+            err
+        );
+        assert!(err.to_string().contains("starting with '-'"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_git_fetch_separator_behavior() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let remote_path = temp_dir.path().join("remote");
+        let local_path = temp_dir.path().join("local");
+        std::fs::create_dir_all(&remote_path)?;
+        std::fs::create_dir_all(&local_path)?;
+
+        crate::git_cmd::in_dir_async(&remote_path)
+            .args(["init", "-b", "main"])
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(&remote_path)
+            .args(["config", "user.name", "Test"])
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(&remote_path)
+            .args(["config", "user.email", "test@test.com"])
+            .output()
+            .await?;
+        std::fs::write(remote_path.join("file.txt"), "hello\n")?;
+        crate::git_cmd::in_dir_async(&remote_path)
+            .args(["add", "."])
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(&remote_path)
+            .args(["commit", "-m", "init"])
+            .output()
+            .await?;
+
+        crate::git_cmd::in_dir_async(&local_path)
+            .args(["init", "-b", "main"])
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(&local_path)
+            .args(["remote", "add", "origin", remote_path.to_str().unwrap()])
+            .output()
+            .await?;
+
+        // 1. git fetch with --end-of-options
+        let out_eoo = crate::git_cmd::in_dir_async(&local_path)
+            .args([
+                "fetch",
+                "--no-tags",
+                "--no-write-fetch-head",
+                "--end-of-options",
+                "origin",
+                "main",
+            ])
+            .output()
+            .await?;
+        assert!(out_eoo.status.success());
+
+        // 2. git fetch with leading dash remote name is blocked by --end-of-options
+        let out_blocked = crate::git_cmd::in_dir_async(&local_path)
+            .args(["fetch", "--end-of-options", "--upload-pack=false", "main"])
+            .output()
+            .await?;
+        assert!(!out_blocked.status.success());
+
+        Ok(())
     }
 }
