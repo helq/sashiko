@@ -9887,6 +9887,16 @@ impl Database {
     /// ahead of retrying rows so failing fetches cannot starve newly enqueued
     /// work. Returns None if nothing is due.
     pub async fn lock_pending_fetch(&self) -> Result<Option<FetchQueueRow>> {
+        self.lock_pending_fetch_with_max_attempts(None).await
+    }
+
+    /// Atomically claim the highest-priority due fetch whose pre-claim attempt
+    /// count does not exceed `max_prev_attempts` (when `Some`), leasing it to
+    /// the caller and bumping its attempt count.
+    pub async fn lock_pending_fetch_with_max_attempts(
+        &self,
+        max_prev_attempts: Option<i64>,
+    ) -> Result<Option<FetchQueueRow>> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs() as i64;
@@ -9901,22 +9911,43 @@ impl Database {
                      SELECT id FROM fetch_queue \
                      WHERE status = 'Pending' \
                        AND (next_retry_at IS NULL OR next_retry_at <= ?) \
+                       AND (? IS NULL OR attempts <= ?) \
                      ORDER BY attempts ASC, priority DESC, created_at ASC LIMIT 1 \
                  ) \
                  RETURNING id, patchset_id, cover_letter_message_id, repo_url, \
                      commit_hash, mr_url, mr_title, mr_number, status, attempts, \
                      first_attempt_at, next_retry_at, locked_at, last_error, \
                      priority, created_at",
-                libsql::params![now, now, now],
+                libsql::params![now, now, now, max_prev_attempts, max_prev_attempts],
             )
             .await?;
 
         if let Some(row) = rows.next().await? {
-            let row = Self::row_to_fetch_queue(&row)?;
+            let mut row = Self::row_to_fetch_queue(&row)?;
+            drop(rows);
+            row.supporting_commits = self.load_supporting_commits(row.id).await?;
             Ok(Some(row))
         } else {
             Ok(None)
         }
+    }
+
+    /// Load the supporting commit SHAs recorded for a claimed fetch, in
+    /// insertion order.
+    async fn load_supporting_commits(&self, fetch_id: i64) -> Result<Vec<String>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT commit_hash FROM fetch_supporting_commits \
+                 WHERE fetch_id = ? ORDER BY id ASC",
+                libsql::params![fetch_id],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(row.get::<String>(0)?);
+        }
+        Ok(out)
     }
 
     fn row_to_fetch_queue(row: &libsql::Row) -> Result<FetchQueueRow> {
