@@ -21,6 +21,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use anyhow::Result;
+
 use serde_json::Value;
 
 use crate::ai::AiProvider;
@@ -71,6 +73,79 @@ impl CherryPickReviewWorkflow {
     pub fn with_stages(mut self, stages: Option<Vec<String>>) -> Self {
         self.stages = stages;
         self
+    }
+
+    #[allow(dead_code, unused_variables)]
+    async fn build_initial_state(
+        &self,
+        env: &CherryPickWorkflowEnv<'_>,
+        patchset: &Value,
+    ) -> Result<CherryPickState> {
+        if self.resolution_sha.starts_with('-')
+            || self.original_sha.starts_with('-')
+            || self.base_sha.as_deref().is_some_and(|s| s.starts_with('-'))
+        {
+            anyhow::bail!("Invalid git ref: contains leading dash");
+        }
+
+        let worktree = env.tools.get_worktree_path();
+
+        let resolved_base_sha = match self.base_sha.as_deref().filter(|s| !s.is_empty()) {
+            Some(sha) => Some(sha.to_string()),
+            None => git_output(
+                worktree,
+                &["rev-parse", &format!("{}~1", self.resolution_sha)],
+            )
+            .await
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        };
+
+        let original_subject = git_subject(worktree, &self.original_sha).await;
+        let base_subject = match resolved_base_sha.as_deref() {
+            Some(sha) => git_subject(worktree, sha).await,
+            None => None,
+        };
+        let resolution_subject = match patchset.get("subject").and_then(|v| v.as_str()) {
+            Some(s) => Some(s.to_string()),
+            None => git_subject(worktree, &self.resolution_sha).await,
+        };
+        let original_diff = match git_show(worktree, &self.original_sha).await {
+            Some(d) => d,
+            None => {
+                if let Some(d) = patchset
+                    .get("conflict")
+                    .and_then(|c| c.get("original_diff"))
+                    .and_then(|v| v.as_str())
+                {
+                    d.to_string()
+                } else if let Some(d) = patchset.get("original_diff").and_then(|v| v.as_str()) {
+                    d.to_string()
+                } else if !tokio::fs::try_exists(worktree.join(".git"))
+                    .await
+                    .unwrap_or(false)
+                    && !tokio::fs::try_exists(worktree.join("HEAD"))
+                        .await
+                        .unwrap_or(false)
+                {
+                    String::new()
+                } else {
+                    anyhow::bail!(
+                        "Failed to read original patch diff for commit {}",
+                        self.original_sha
+                    );
+                }
+            }
+        };
+        let resolution_diff = extract_resolution_diff(patchset);
+
+        Ok(CherryPickState {
+            original_sha: self.original_sha.clone(),
+            resolution_sha: self.resolution_sha.clone(),
+            original_diff,
+            target_commit_diff: resolution_diff,
+            ..Default::default()
+        })
     }
 }
 
@@ -157,7 +232,6 @@ async fn read_bounded_git_output(
     })
 }
 
-#[allow(dead_code)]
 fn extract_resolution_diff(patchset: &Value) -> String {
     patchset
         .get("patches")
@@ -229,7 +303,6 @@ async fn git_output(worktree: &Path, args: &[&str]) -> Option<String> {
     }
 }
 
-#[allow(dead_code)]
 async fn git_subject(worktree: &Path, sha: &str) -> Option<String> {
     git_output(
         worktree,
@@ -239,7 +312,6 @@ async fn git_subject(worktree: &Path, sha: &str) -> Option<String> {
     .map(|s| s.trim().to_string())
 }
 
-#[allow(dead_code)]
 async fn git_show(worktree: &Path, sha: &str) -> Option<String> {
     git_output(worktree, &["show", "--end-of-options", sha]).await
 }
