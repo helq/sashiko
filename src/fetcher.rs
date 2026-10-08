@@ -243,6 +243,100 @@ impl FetchWorker {
             None => row.commit_hash.clone(),
         }
     }
+
+    /// Ensure every commit referenced by the row exists locally, fetching from
+    /// the remote when necessary.
+    #[allow(dead_code)]
+    async fn ensure_present(&self, row: &FetchQueueRow) -> Result<()> {
+        // For ranges (base..head, base...head), endpoints must be checked individually.
+        let mut to_check = parse_commit_range_endpoints(&row.commit_hash)
+            .map_err(|e| PermanentFetchError(e.to_string()))?;
+        for sha in &row.supporting_commits {
+            let endpoints = parse_commit_range_endpoints(sha)
+                .map_err(|e| PermanentFetchError(e.to_string()))?;
+            to_check.extend(endpoints);
+        }
+
+        let mut missing = Vec::new();
+        for commit in &to_check {
+            let trimmed = commit.trim();
+            if trimmed.is_empty()
+                || trimmed.chars().any(char::is_whitespace)
+                || trimmed.starts_with('-')
+                || trimmed.starts_with('+')
+                || trimmed.contains(':')
+            {
+                return Err(
+                    PermanentFetchError(format!("Invalid commit reference: {}", commit)).into(),
+                );
+            }
+            if !self.is_present(trimmed).await {
+                missing.push(trimmed.to_string());
+            }
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        let url = match row.repo_url.as_deref().map(str::trim) {
+            Some(u) if !u.is_empty() => u,
+            _ => {
+                return Err(PermanentFetchError(format!(
+                    "commits {:?} missing and no remote is configured",
+                    missing
+                ))
+                .into());
+            }
+        };
+
+        // A local repository cannot be fetched from; the commits simply are not
+        // there.
+        let is_local = {
+            let url_path = PathBuf::from(url);
+            match (
+                tokio::fs::canonicalize(&url_path).await,
+                tokio::fs::canonicalize(&self.repo_path).await,
+            ) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => false,
+            }
+        };
+        if is_local {
+            return Err(PermanentFetchError(format!(
+                "repository is local but commits are missing: {:?}",
+                missing
+            ))
+            .into());
+        }
+
+        let remote_name = self.get_remote_name(url);
+
+        // Acquire the per-remote lock so we never run concurrent fetches
+        // against the same remote (shared with ensure_remote_with_refspecs
+        // and batch_prefetch).
+        let lock = crate::git_ops::get_remote_lock(&remote_name);
+        let _guard = lock.lock().await;
+
+        self.ensure_remote(&remote_name, url).await?;
+
+        // Fetch exactly the missing revisions. We deliberately do NOT fall
+        // back to a full `git fetch` of all refs: large mirrors (e.g. the kernel
+        // repo with hundreds of thousands of refs) make that pathologically
+        // slow, and it is unnecessary -- a still-missing object here is
+        // genuinely unfetchable and should surface as an error.
+        self.fetch_commits(&remote_name, &missing).await?;
+        for commit in &missing {
+            if !self.is_present(commit).await {
+                return Err(PermanentFetchError(format!(
+                    "commit {} still missing after fetch from {}",
+                    commit,
+                    redact_secret(url)
+                ))
+                .into());
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
