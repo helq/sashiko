@@ -28,12 +28,14 @@ use serde_json::{Value, json};
 use crate::ai::AiProvider;
 use crate::toolbox::ToolBox;
 use crate::worker::prompts::PromptRegistry;
-use crate::workflow::{OutputFormat, PromptTemplate, RecitationPolicy, Stage, ToolScope};
+use crate::workflow::{
+    OutputFormat, PromptTemplate, RecitationPolicy, Stage, StagePolicy, ToolScope,
+};
 use crate::workflows::linux_patch_review;
 
 use super::prompts::{
     ANALYSIS_FORMAT_GUIDANCE, DROPPED_CHANGES, MERGE_CONFLICT_REVIEW_FRAMING, MERGE_CORRECTNESS,
-    PREFETCHED_CONTEXT_HEADER, SEMANTIC_INTENT,
+    PLANNING, PREFETCHED_CONTEXT_HEADER, SEMANTIC_INTENT,
 };
 
 /// A cherry-pick / merge-conflict resolution review workflow.
@@ -461,6 +463,75 @@ async fn git_subject(worktree: &Path, sha: &str) -> Option<String> {
 
 async fn git_show(worktree: &Path, sha: &str) -> Option<String> {
     git_output(worktree, &["show", "--end-of-options", sha]).await
+}
+
+#[allow(dead_code)]
+fn build_planning_stage() -> Stage<CherryPickState, Value> {
+    Stage::builder("planning")
+        .skip_if(|s: &CherryPickState| s.manual_stages.is_some())
+        .system_prompt(cherry_pick_system_prompt(true))
+        .user_prompt(PromptTemplate::new(PLANNING))
+        .output_format(
+            OutputFormat::json_with_schema(json!({
+                "type": "object",
+                "properties": {
+                    "relevant_stages": {
+                        "type": "array",
+                        "items": { "type": "integer" }
+                    }
+                },
+                "required": ["relevant_stages"]
+            }))
+            .with_validator(|val: &Value, _| {
+                let arr = val
+                    .get("relevant_stages")
+                    .and_then(|v| v.as_array())
+                    .ok_or_else(|| "missing 'relevant_stages' array".to_string())?;
+                if !arr
+                    .iter()
+                    .all(|v| v.as_u64().is_some_and(|n| (1..=7).contains(&n)))
+                {
+                    return Err(
+                        "all elements in 'relevant_stages' must be stage numbers between 1 and 7"
+                            .to_string(),
+                    );
+                }
+                Ok(())
+            })
+            .with_feedback_formatter(|err| {
+                format!(
+                    "Your previous response was not valid JSON or did not match the required schema: {}\nPlease try again with ONLY a valid JSON object.",
+                    err
+                )
+            }),
+        )
+        .policy(StagePolicy {
+            tools: ToolScope::None,
+            temperature: 0.0,
+            max_validation_attempts: 2,
+            ..Default::default()
+        })
+        .on_validation_exhausted(|state: &mut CherryPickState| {
+            state.planned_stages = vec![1, 2, 3, 4, 5, 6, 7];
+        })
+        .reduce(|state: &mut CherryPickState, val: Value| {
+            let mut stages = vec![1u8, 2, 3];
+            if let Some(arr) = val["relevant_stages"].as_array() {
+                for v in arr {
+                    if let Some(n) = v.as_u64()
+                        && (4..=7).contains(&n)
+                    {
+                        let n = n as u8;
+                        if !stages.contains(&n) {
+                            stages.push(n);
+                        }
+                    }
+                }
+            }
+            tracing::info!("Planning phase selected stages: {:?}", stages);
+            state.planned_stages = stages;
+        })
+        .build()
 }
 
 #[allow(dead_code)]
