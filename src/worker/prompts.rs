@@ -88,7 +88,7 @@ pub struct ReviewInput {
     pub patches: Vec<PatchInput>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct WorkerConfig {
     pub project: ProjectId,
     pub max_input_tokens: usize,
@@ -186,6 +186,7 @@ pub struct Worker {
     skip_report: bool,
     report_preexisting: bool,
     effort: Option<crate::ai::EffortMode>,
+    review_context: Option<crate::review_kind::ReviewKind>,
 }
 
 impl Worker {
@@ -211,6 +212,7 @@ impl Worker {
             skip_report: config.skip_report,
             report_preexisting: config.report_preexisting,
             effort: config.effort,
+            review_context: config.review_context,
         }
     }
 
@@ -272,6 +274,64 @@ impl Worker {
             && let Some(vhead) = self.tools.get_virtual_head()
         {
             target_commit_sha = vhead;
+        }
+
+        if let Some(ref review_kind) = self.review_context {
+            let cherry_pick_stages = if let Some(ref stage_strs) = self.stages {
+                let mut parsed = Vec::new();
+                for s in stage_strs {
+                    match s.parse::<u8>() {
+                        Ok(n) if (1..=7).contains(&n) => parsed.push(n),
+                        _ => {
+                            anyhow::bail!(
+                                "Invalid stage '{}' in --stages for cherry-pick review",
+                                s
+                            )
+                        }
+                    }
+                }
+                Some(parsed)
+            } else {
+                None
+            };
+
+            let env = crate::workflows::cherry_pick_review::CherryPickWorkflowEnv {
+                provider: self.provider.clone(),
+                tools: self.tools.clone(),
+                prompts: &self.prompts,
+                temperature: self.temperature,
+                max_interactions: self.max_interactions,
+                context_tag: self.context_tag.clone(),
+                stages: cherry_pick_stages,
+                series_range: self.series_range.clone(),
+                custom_prompt: self.custom_prompt.clone(),
+            };
+
+            return match review_kind {
+                crate::review_kind::ReviewKind::CherryPick { .. } => {
+                    if self.project != ProjectId::Linux {
+                        anyhow::bail!(
+                            "Cherry-pick review is currently only supported for the Linux project (called with {:?})",
+                            self.project
+                        );
+                    }
+                    if target_commit_sha == "unknown" {
+                        anyhow::bail!(
+                            "Cannot run cherry-pick review: target resolution commit SHA is unknown"
+                        );
+                    }
+                    let resolution_sha = target_commit_sha;
+                    let workflow =
+                        crate::workflows::cherry_pick_review::CherryPickReviewWorkflow::from_review_kind(
+                            review_kind,
+                            resolution_sha,
+                        );
+                    crate::workflows::cherry_pick_review::execute_workflow(
+                        &workflow, &env, patchset, progress,
+                    )
+                    .await
+                }
+            };
         }
 
         if let Some(patches) = patchset["patches"].as_array() {
@@ -1701,5 +1761,118 @@ mod tests {
                 .unwrap()
                 .contains("wasn't introduced by this patch")
         );
+    }
+
+    #[tokio::test]
+    async fn test_cherry_pick_invalid_stages_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompts = PromptRegistry::new(dir.path().to_path_buf());
+        let provider = std::sync::Arc::new(MockBlockedProvider {
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let tools = ToolBox::new(dir.path().to_path_buf(), None);
+        let config = WorkerConfig {
+            project: ProjectId::Linux,
+            max_input_tokens: 10000,
+            max_interactions: 3,
+            temperature: 0.0,
+            series_range: None,
+            baseline_sha: None,
+            custom_prompt: None,
+            stages: Some(vec!["invalid".to_string()]),
+            review_context: Some(crate::review_kind::ReviewKind::CherryPick {
+                original_sha: "orig".to_string(),
+                base_sha: None,
+            }),
+            ..Default::default()
+        };
+        let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
+        let patchset = serde_json::json!({
+            "patches": [{ "commit_id": "res123" }]
+        });
+        match worker.run(patchset, None).await {
+            Ok(_) => panic!("Expected error for invalid stage"),
+            Err(e) => {
+                assert!(
+                    e.to_string()
+                        .contains("Invalid stage 'invalid' in --stages for cherry-pick review")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cherry_pick_unknown_resolution_sha_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompts = PromptRegistry::new(dir.path().to_path_buf());
+        let provider = std::sync::Arc::new(MockBlockedProvider {
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let tools = ToolBox::new(dir.path().to_path_buf(), None);
+        let config = WorkerConfig {
+            project: ProjectId::Linux,
+            max_input_tokens: 10000,
+            max_interactions: 3,
+            temperature: 0.0,
+            series_range: None,
+            baseline_sha: None,
+            custom_prompt: None,
+            stages: None,
+            review_context: Some(crate::review_kind::ReviewKind::CherryPick {
+                original_sha: "orig".to_string(),
+                base_sha: None,
+            }),
+            ..Default::default()
+        };
+        let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
+        // Patchset with no commit_id in patches results in target_commit_sha = "unknown"
+        let patchset = serde_json::json!({
+            "patches": []
+        });
+        match worker.run(patchset, None).await {
+            Ok(_) => panic!("Expected error for unknown target resolution commit SHA"),
+            Err(e) => {
+                assert!(e.to_string().contains(
+                    "Cannot run cherry-pick review: target resolution commit SHA is unknown"
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cherry_pick_non_linux_project_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompts = PromptRegistry::new(dir.path().to_path_buf());
+        let provider = std::sync::Arc::new(MockBlockedProvider {
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let tools = ToolBox::new(dir.path().to_path_buf(), None);
+        let config = WorkerConfig {
+            project: ProjectId::Sashiko,
+            max_input_tokens: 10000,
+            max_interactions: 3,
+            temperature: 0.0,
+            series_range: None,
+            baseline_sha: None,
+            custom_prompt: None,
+            stages: None,
+            review_context: Some(crate::review_kind::ReviewKind::CherryPick {
+                original_sha: "orig".to_string(),
+                base_sha: None,
+            }),
+            ..Default::default()
+        };
+        let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
+        let patchset = serde_json::json!({
+            "patches": [{ "commit_id": "res123" }]
+        });
+        match worker.run(patchset, None).await {
+            Ok(_) => panic!("Expected error for non-Linux project"),
+            Err(e) => {
+                assert!(e.to_string().contains(
+                    "Cherry-pick review is currently only supported for the Linux project (called with Sashiko)"
+                ));
+            }
+        }
     }
 }
