@@ -9569,9 +9569,16 @@ impl Database {
     }
 
     pub async fn rerun_patchset(&self, id: i64) -> Result<()> {
+        self.rerun_patchset_to_status(id, "Pending")
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn rerun_patchset_to_status(&self, id: i64, status: &str) -> Result<bool> {
+        let tx = self.begin_transaction().await?;
+
         // 1. Get current status of the patchset
-        let mut rows = self
-            .conn
+        let mut rows = tx
             .query(
                 "SELECT status FROM patchsets WHERE id = ?",
                 libsql::params![id],
@@ -9583,50 +9590,63 @@ impl Database {
         } else {
             None
         };
+        drop(rows);
+
+        if current_status.as_deref() == Some("In Review") {
+            tx.rollback().await?;
+            return Ok(false);
+        }
 
         let should_increment = current_status.as_deref() == Some("Reviewed");
 
-        // 2. Reset patchset status to Pending
-        self.execute(
-            "UPDATE patchsets SET status = 'Pending' WHERE id = ?",
+        // 2. Reset patchset status to the target status
+        let updated = tx
+            .execute(
+                "UPDATE patchsets SET status = ? WHERE id = ? AND COALESCE(status, '') != 'In Review'",
+                libsql::params![status, id],
+            )
+            .await?;
+        if updated == 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+
+        // 3. Increment target_review_count only if it was previously Reviewed
+        if should_increment {
+            tx.execute(
+                "UPDATE patchsets SET target_review_count = COALESCE(target_review_count, 1) + 1 WHERE id = ?",
+                libsql::params![id],
+            )
+            .await?;
+        }
+
+        // 4. Delete associated tool usages and findings for failed reviews that block retrying
+        tx.execute(
+            "DELETE FROM tool_usages WHERE review_id IN (
+                SELECT id FROM reviews WHERE patchset_id = ? AND status IN ('Failed', 'FailedToApply') AND interaction_id IS NULL
+            )",
             libsql::params![id],
         )
         .await?;
 
-        // 3. Increment target_review_count only if it was previously Reviewed
-        if should_increment {
-            self.execute(
-                    "UPDATE patchsets SET target_review_count = COALESCE(target_review_count, 1) + 1 WHERE id = ?",
-                    libsql::params![id],
-                )
-                .await?;
-        }
-
-        // 4. Delete associated tool usages and findings for failed reviews that block retrying
-        self.execute(
-                "DELETE FROM tool_usages WHERE review_id IN (
-                    SELECT id FROM reviews WHERE patchset_id = ? AND status IN ('Failed', 'FailedToApply') AND interaction_id IS NULL
-                )",
-                libsql::params![id],
-            )
-            .await?;
-
-        self.execute(
-                "DELETE FROM findings WHERE review_id IN (
-                    SELECT id FROM reviews WHERE patchset_id = ? AND status IN ('Failed', 'FailedToApply') AND interaction_id IS NULL
-                )",
-                libsql::params![id],
-            )
-            .await?;
+        tx.execute(
+            "DELETE FROM findings WHERE review_id IN (
+                SELECT id FROM reviews WHERE patchset_id = ? AND status IN ('Failed', 'FailedToApply') AND interaction_id IS NULL
+            )",
+            libsql::params![id],
+        )
+        .await?;
 
         // 5. Delete failed reviews that block retrying (infra failures)
-        self.execute(
-                "DELETE FROM reviews WHERE patchset_id = ? AND status IN ('Failed', 'FailedToApply') AND interaction_id IS NULL",
-                libsql::params![id],
-            )
-            .await?;
+        tx.execute(
+            "DELETE FROM reviews WHERE patchset_id = ? AND status IN ('Failed', 'FailedToApply') AND interaction_id IS NULL",
+            libsql::params![id],
+        )
+        .await?;
 
-        Ok(())
+        tx.commit().await?;
+
+        Ok(true)
     }
 
     pub async fn rerun_patch(&self, patchset_id: i64, _patch_id: i64) -> Result<()> {

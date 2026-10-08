@@ -634,14 +634,94 @@ async fn submit_patch(
                 return Err(StatusCode::BAD_REQUEST.into_response());
             }
 
-            let review_kind = ReviewKind::CherryPick {
+            let review_context = ReviewKind::CherryPick {
                 original_sha: original_sha.clone(),
                 base_sha: base_sha.clone(),
             };
-            let _review_context_json = match serde_json::to_string(&review_kind) {
-                Ok(s) => s,
+            let review_context_json = match serde_json::to_string(&review_context) {
+                Ok(json) => json,
                 Err(e) => {
-                    error!("Failed to serialize review context: {}", e);
+                    error!("Failed to serialize review_context: {}", e);
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                }
+            };
+
+            let id = sha.clone();
+            let _already_ingested = match state.db.find_patchset_id_by_msgid(&id).await {
+                Ok(Some(existing_id)) => {
+                    if !is_authorized(
+                        &state,
+                        &headers,
+                        auth.0.as_ref(),
+                        crate::settings::Permission::Review,
+                    ) {
+                        info!(
+                            "Refused unauthorized cherry-pick rerun of already ingested patchset {} from {}",
+                            existing_id, addr
+                        );
+                        return Err(StatusCode::FORBIDDEN.into_response());
+                    }
+
+                    let is_multi = match state.db.is_multi_patch_series(existing_id).await {
+                        Ok(m) => m,
+                        Err(e) => {
+                            error!(
+                                "Failed to check if patchset {} is multi-patch: {}",
+                                existing_id, e
+                            );
+                            return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                        }
+                    };
+                    if is_multi {
+                        warn!(
+                            "cannot apply cherry-pick context to multi-patch series (patchset {})",
+                            existing_id
+                        );
+                        return Err(StatusCode::BAD_REQUEST.into_response());
+                    }
+
+                    match state
+                        .db
+                        .rerun_patchset_to_status(existing_id, "Fetching")
+                        .await
+                    {
+                        Ok(false) => {
+                            warn!(
+                                "cannot rerun cherry-pick on patchset {} while actively in review",
+                                existing_id
+                            );
+                            return Err(StatusCode::CONFLICT.into_response());
+                        }
+                        Ok(true) => {}
+                        Err(e) => {
+                            error!(
+                                "Failed to reset review state to Fetching for already ingested {}: {}",
+                                existing_id, e
+                            );
+                            return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                        }
+                    }
+
+                    info!(
+                        "Cherry-pick fetch request for already ingested SHA {}, updating review context",
+                        id
+                    );
+                    if let Err(e) = state
+                        .db
+                        .set_review_context(existing_id, &review_context_json)
+                        .await
+                    {
+                        error!(
+                            "Failed to persist review_context for already ingested {}: {}",
+                            existing_id, e
+                        );
+                        return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                    }
+                    true
+                }
+                Ok(None) => false,
+                Err(e) => {
+                    error!("Failed to find patchset id by msgid {}: {}", id, e);
                     return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
                 }
             };
