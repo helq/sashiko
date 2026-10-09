@@ -15,6 +15,16 @@
 /// Output format guidance appended to analysis stage prompts.
 pub const ANALYSIS_FORMAT_GUIDANCE: &str = include_str!("prompts/analysis_format_guidance.md");
 
+/// Stage 12 (synthesis): final cherry-pick review report.
+pub const CONFLICT_REPORT: &str = include_str!("prompts/conflict_report.md");
+
+/// Stage 8 (synthesis): deduplication and consolidation instructions.
+pub const CHERRY_PICK_DEDUPLICATION_INSTRUCTION: &str = include_str!("prompts/deduplication.md");
+
+/// Stage 9 (synthesis): conflict resolution instructions.
+pub const CHERRY_PICK_CONFLICT_RESOLUTION_INSTRUCTION: &str =
+    include_str!("prompts/conflict_resolution.md");
+
 /// Stage 2 (analysis): detection of changes dropped during resolution.
 pub const DROPPED_CHANGES: &str = include_str!("prompts/dropped_changes.md");
 
@@ -37,3 +47,6 @@ pub const PREFETCHED_CONTEXT_HEADER: &str = include_str!("prompts/prefetched_con
 
 /// Stage 1 (analysis): semantic-intent preservation of the resolution.
 pub const SEMANTIC_INTENT: &str = include_str!("prompts/semantic_intent.md");
+
+/// Stage 10 (synthesis): verification and severity estimation.
+pub const VERIFICATION: &str = include_str!("prompts/verification.md");

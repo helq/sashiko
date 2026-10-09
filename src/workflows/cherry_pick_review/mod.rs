@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Cherry-pick review: finding filter.
+//! Cherry-pick review: finding filter and stage prompts.
 
 pub mod filter;
 pub mod prompts;
 
 pub use filter::filter_cherry_pick_findings;
+pub use prompts::*;
