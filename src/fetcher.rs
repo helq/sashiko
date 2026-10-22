@@ -726,6 +726,13 @@ impl FetchWorker {
         loop {
             let mut cmd = self.fetch_base_cmd();
             cmd.args(args);
+            // DO NOT wrap this fetch in a timeout. Network transfer and
+            // `git index-pack` delta resolution for large repositories (e.g.
+            // internal kernel build trees with hundreds of thousands of
+            // objects) legitimately take significant time. Imposing a timeout
+            // drops the child process, triggering SIGKILL via `kill_on_drop`,
+            // which causes git to discard the partial pack and forces the
+            // fetch worker into an endless retry loop.
             let output = cmd.output().await?;
 
             if output.status.success() || dropped_graph {
