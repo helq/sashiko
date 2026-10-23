@@ -46,6 +46,11 @@ const BATCH_SIZE: usize = 20;
 /// unbounded processing and resource exhaustion from untrusted inputs.
 const MAX_RANGE_COMMITS: usize = 256;
 
+/// Maximum attempts for `git fetch` failures that return `HTTP 400` with
+/// `expected 'packfile'` or `expected 'acknowledgments'` (server-side
+/// upload-pack timeout / rejection) before treating the failure as terminal.
+const MAX_HTTP_400_ATTEMPTS: i64 = 3;
+
 /// Marker error for failures that can never succeed on retry (e.g. a commit
 /// is missing and the row has no remote to fetch from). These bypass the
 /// backoff retry window and fail the fetch immediately, mirroring the
@@ -60,6 +65,24 @@ impl std::fmt::Display for PermanentFetchError {
 }
 
 impl std::error::Error for PermanentFetchError {}
+
+/// Returns true when `git fetch` stderr indicates the requested object or ref
+/// permanently does not exist or is not allowed by the remote server.
+fn is_permanent_git_fetch_stderr(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("not our ref")
+        || lower.contains("unadvertised object")
+        || lower.contains("couldn't find remote ref")
+        || lower.contains("no such remote ref")
+}
+
+/// Returns true when a fetch failure message matches a Git-on-Borg `HTTP 400`
+/// upload-pack timeout or rejection (`expected 'packfile'` or
+/// `expected 'acknowledgments'`).
+fn is_http_400_packfile_rejection(msg: &str) -> bool {
+    msg.contains("HTTP 400")
+        && (msg.contains("expected 'packfile'") || msg.contains("expected 'acknowledgments'"))
+}
 
 /// Derive the git commit or range to fetch from a placeholder message id.
 ///
@@ -623,10 +646,17 @@ impl FetchWorker {
         let first = row.first_attempt_at.unwrap_or(now);
         let permanent = error.chain().any(|e| e.is::<PermanentFetchError>());
         let msg = format!("{:#}", error);
+        let http_400_exhausted =
+            row.attempts >= MAX_HTTP_400_ATTEMPTS && is_http_400_packfile_rejection(&msg);
         if permanent {
             error!(
                 "Fetch {} for {} failed permanently (not retrying): {}",
                 row.id, row.commit_hash, msg
+            );
+        } else if http_400_exhausted {
+            error!(
+                "Fetch {} for {} failed after {} HTTP 400 upload-pack attempts (not retrying): {}",
+                row.id, row.commit_hash, row.attempts, msg
             );
         } else if now - first >= RETRY_WINDOW_SECS {
             error!(
@@ -637,7 +667,7 @@ impl FetchWorker {
                 msg
             );
         }
-        if permanent || now - first >= RETRY_WINDOW_SECS {
+        if permanent || http_400_exhausted || now - first >= RETRY_WINDOW_SECS {
             if let Err(e) = self.db.mark_fetch_failed(row.id, &msg).await {
                 error!("Failed to mark fetch {} failed: {}", row.id, e);
             }
@@ -866,11 +896,16 @@ impl FetchWorker {
             args.extend(object_ids.iter().copied());
             let output = self.fetch_with_graph_retry(&args).await?;
             if !output.status.success() {
-                return Err(anyhow!(
+                let redacted = redact_secret(String::from_utf8_lossy(&output.stderr).trim());
+                let msg = format!(
                     "fetch of {} object(s) failed: {}",
                     object_ids.len(),
-                    redact_secret(String::from_utf8_lossy(&output.stderr).trim())
-                ));
+                    redacted
+                );
+                if is_permanent_git_fetch_stderr(&redacted) {
+                    return Err(PermanentFetchError(msg).into());
+                }
+                return Err(anyhow!(msg));
             }
         }
 
@@ -886,11 +921,13 @@ impl FetchWorker {
                 ])
                 .await?;
             if !output.status.success() {
-                let err = anyhow!(
-                    "fetch of ref {} failed: {}",
-                    name,
-                    redact_secret(String::from_utf8_lossy(&output.stderr).trim())
-                );
+                let redacted = redact_secret(String::from_utf8_lossy(&output.stderr).trim());
+                let msg = format!("fetch of ref {} failed: {}", name, redacted);
+                let err = if is_permanent_git_fetch_stderr(&redacted) {
+                    PermanentFetchError(msg).into()
+                } else {
+                    anyhow!(msg)
+                };
                 if first_err.is_none() {
                     first_err = Some(err);
                 }
@@ -1989,6 +2026,91 @@ mod tests {
         worker.ensure_present(&row).await?;
         assert!(worker.is_present(&base_sha).await);
         assert!(worker.is_present(&head_sha).await);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_permanent_git_fetch_stderr_and_http_400_classification() {
+        assert!(is_permanent_git_fetch_stderr(
+            "fatal: remote error: upload-pack: not our ref c2f80695652667d6f1e1a5561af15948217d2315"
+        ));
+        assert!(is_permanent_git_fetch_stderr(
+            "error: Server does not allow request for unadvertised object deadbeef"
+        ));
+        assert!(is_permanent_git_fetch_stderr(
+            "fatal: couldn't find remote ref refs/heads/missing"
+        ));
+        assert!(!is_permanent_git_fetch_stderr(
+            "error: RPC failed; HTTP 503 curl 22 The requested URL returned error: 503"
+        ));
+
+        assert!(is_http_400_packfile_rejection(
+            "fetch of 2 object(s) failed: error: RPC failed; HTTP 400 curl 22 The requested URL returned error: 400\nfatal: expected 'packfile'"
+        ));
+        assert!(is_http_400_packfile_rejection(
+            "fetch of 1 object(s) failed: error: RPC failed; HTTP 400 curl 22 The requested URL returned error: 400\nfatal: expected 'acknowledgments'"
+        ));
+        assert!(!is_http_400_packfile_rejection(
+            "fetch of 1 object(s) failed: error: RPC failed; HTTP 500 curl 22 The requested URL returned error: 500\nfatal: expected 'packfile'"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_handle_failure_caps_http_400_retries_at_three_attempts() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Arc::new(Database::new(&settings).await?);
+        db.migrate().await?;
+        let (tx, mut rx) = mpsc::channel(10);
+        let worker = FetchWorker::new(temp_dir.path().to_path_buf(), Arc::clone(&db), tx, None);
+
+        db.enqueue_fetch(
+            None,
+            Some("cover-400"),
+            Some("https://example.com/repo.git"),
+            "base..head",
+            None,
+            None,
+            None,
+            500,
+        )
+        .await?;
+
+        let http_400_msg = "fetch of 2 object(s) failed: error: RPC failed; HTTP 400 curl 22 The requested URL returned error: 400\nfatal: expected 'packfile'";
+
+        // Attempts 1 and 2 reschedule with backoff rather than failing terminally.
+        for expected_attempt in 1..=2 {
+            let mut row = db.lock_pending_fetch().await?.unwrap();
+            assert_eq!(row.attempts, expected_attempt);
+            worker.handle_failure(&row, anyhow!(http_400_msg)).await;
+            assert!(rx.try_recv().is_err());
+            // Fast-forward retry window so we can claim the next attempt.
+            row.next_retry_at = Some(1);
+            db.set_fetch_retry_at(row.id, 1, http_400_msg).await?;
+        }
+
+        // Attempt 3 hits MAX_HTTP_400_ATTEMPTS and fails terminally.
+        let row3 = db.lock_pending_fetch().await?.unwrap();
+        assert_eq!(row3.attempts, 3);
+        worker.handle_failure(&row3, anyhow!(http_400_msg)).await;
+
+        let ev = rx
+            .try_recv()
+            .expect("expected IngestionFailed on attempt 3");
+        match ev {
+            Event::IngestionFailed {
+                article_id, error, ..
+            } => {
+                assert_eq!(article_id, "base..head");
+                assert!(error.contains("HTTP 400"));
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+        assert!(db.lock_pending_fetch().await?.is_none());
 
         Ok(())
     }
