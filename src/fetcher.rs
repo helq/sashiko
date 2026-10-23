@@ -101,12 +101,14 @@ fn looks_like_object_id(rev: &str) -> bool {
     matches!(rev.len(), 40 | 64) && rev.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Extract commit endpoints from a commit specifier or range.
+/// Split a commit or commit-range specifier into its primary (`head`) endpoint
+/// and an optional ancestor (`base`) endpoint.
 ///
-/// Both endpoints of a range must be non-empty (e.g. `base..head` or `base...head`).
-/// Open-ended ranges (e.g. `..head`, `base..`, `...head`, `base...`) are invalid
-/// and rejected with an error.
-pub fn parse_commit_range_endpoints(spec: &str) -> Result<Vec<String>> {
+/// For a single commit `sha`, returns `(sha, None)`. For `base..head` or
+/// `base...head`, returns `(head, Some(base))` so callers can fetch `head`
+/// first and only request `base` from the remote if it is still absent after
+/// `head`'s packfile arrives.
+pub fn parse_commit_range_phases(spec: &str) -> Result<(String, Option<String>)> {
     let spec = spec.trim();
     if spec.is_empty() {
         return Err(anyhow!("Commit specifier must not be empty"));
@@ -117,7 +119,7 @@ pub fn parse_commit_range_endpoints(spec: &str) -> Result<Vec<String>> {
     } else if let Some((start, end)) = spec.split_once("..") {
         (start.trim(), end.trim())
     } else {
-        return Ok(vec![spec.to_string()]);
+        return Ok((spec.to_string(), None));
     };
 
     if start.is_empty() || end.is_empty() {
@@ -127,7 +129,20 @@ pub fn parse_commit_range_endpoints(spec: &str) -> Result<Vec<String>> {
         ));
     }
 
-    Ok(vec![start.to_string(), end.to_string()])
+    Ok((end.to_string(), Some(start.to_string())))
+}
+
+/// Extract commit endpoints from a commit specifier or range.
+///
+/// Both endpoints of a range must be non-empty (e.g. `base..head` or `base...head`).
+/// Open-ended ranges (e.g. `..head`, `base..`, `...head`, `base...`) are invalid
+/// and rejected with an error.
+pub fn parse_commit_range_endpoints(spec: &str) -> Result<Vec<String>> {
+    let (head, base) = parse_commit_range_phases(spec)?;
+    match base {
+        Some(b) => Ok(vec![b, head]),
+        None => Ok(vec![head]),
+    }
 }
 
 /// RAII guard that aborts a spawned Tokio task on drop.
@@ -372,17 +387,28 @@ impl FetchWorker {
     /// Ensure every commit referenced by the row exists locally, fetching from
     /// the remote when necessary.
     async fn ensure_present(&self, row: &FetchQueueRow) -> Result<()> {
-        // For ranges (base..head, base...head), endpoints must be checked individually.
-        let mut to_check = parse_commit_range_endpoints(&row.commit_hash)
+        // For ranges (base..head, base...head), split endpoints into primary
+        // (head) and secondary (base) phases. Fetching head first brings its
+        // ancestor history along in the same packfile, avoiding expensive
+        // non-tip reachability walks on remotes with hundreds of thousands of
+        // refs when base is already an ancestor of head.
+        let (head, base) = parse_commit_range_phases(&row.commit_hash)
             .map_err(|e| PermanentFetchError(e.to_string()))?;
+        let mut primary_to_check = vec![head];
+        let mut base_to_check = Vec::new();
+        if let Some(b) = base {
+            base_to_check.push(b);
+        }
         for sha in &row.supporting_commits {
-            let endpoints = parse_commit_range_endpoints(sha)
-                .map_err(|e| PermanentFetchError(e.to_string()))?;
-            to_check.extend(endpoints);
+            let (sup_head, sup_base) =
+                parse_commit_range_phases(sha).map_err(|e| PermanentFetchError(e.to_string()))?;
+            primary_to_check.push(sup_head);
+            if let Some(b) = sup_base {
+                base_to_check.push(b);
+            }
         }
 
-        let mut missing = Vec::new();
-        for commit in &to_check {
+        for commit in primary_to_check.iter().chain(base_to_check.iter()) {
             let trimmed = commit.trim();
             if trimmed.is_empty()
                 || trimmed.chars().any(char::is_whitespace)
@@ -394,20 +420,38 @@ impl FetchWorker {
                     PermanentFetchError(format!("Invalid commit reference: {}", commit)).into(),
                 );
             }
+        }
+
+        let mut missing_primary = Vec::new();
+        for commit in &primary_to_check {
+            let trimmed = commit.trim();
             if !self.is_present(trimmed).await {
-                missing.push(trimmed.to_string());
+                missing_primary.push(trimmed.to_string());
             }
         }
-        if missing.is_empty() {
+        let mut missing_base = Vec::new();
+        for commit in &base_to_check {
+            let trimmed = commit.trim();
+            if !self.is_present(trimmed).await {
+                missing_base.push(trimmed.to_string());
+            }
+        }
+        if missing_primary.is_empty() && missing_base.is_empty() {
             return Ok(());
         }
+
+        let all_missing: Vec<String> = missing_primary
+            .iter()
+            .chain(missing_base.iter())
+            .cloned()
+            .collect();
 
         let url = match row.repo_url.as_deref().map(str::trim) {
             Some(u) if !u.is_empty() => u,
             _ => {
                 return Err(PermanentFetchError(format!(
                     "commits {:?} missing and no remote is configured",
-                    missing
+                    all_missing
                 ))
                 .into());
             }
@@ -428,7 +472,7 @@ impl FetchWorker {
         if is_local {
             return Err(PermanentFetchError(format!(
                 "repository is local but commits are missing: {:?}",
-                missing
+                all_missing
             ))
             .into());
         }
@@ -443,13 +487,38 @@ impl FetchWorker {
 
         self.ensure_remote(&remote_name, url).await?;
 
-        // Fetch exactly the missing revisions. We deliberately do NOT fall
-        // back to a full `git fetch` of all refs: large mirrors (e.g. the kernel
-        // repo with hundreds of thousands of refs) make that pathologically
-        // slow, and it is unnecessary -- a still-missing object here is
-        // genuinely unfetchable and should surface as an error.
-        self.fetch_commits(&remote_name, &missing).await?;
-        for commit in &missing {
+        // Phase 1: Fetch missing primary (head) revisions first. We deliberately
+        // do NOT fall back to a full `git fetch` of all refs: large mirrors
+        // (e.g. the kernel repo with hundreds of thousands of refs) make that
+        // pathologically slow, and it is unnecessary -- a still-missing object
+        // here is genuinely unfetchable and should surface as an error.
+        let mut still_missing_primary = Vec::new();
+        for commit in &missing_primary {
+            if !self.is_present(commit).await {
+                still_missing_primary.push(commit.clone());
+            }
+        }
+        if !still_missing_primary.is_empty() {
+            self.fetch_commits(&remote_name, &still_missing_primary)
+                .await?;
+        }
+
+        // Phase 2: Re-check any missing base endpoints after Phase 1. For normal
+        // ancestor ranges (base..head), fetching head already downloaded base in
+        // the packfile. Only fetch base explicitly if it remains absent (e.g. a
+        // divergent three-dot range base...head).
+        let mut still_missing_base = Vec::new();
+        for commit in &missing_base {
+            if !self.is_present(commit).await {
+                still_missing_base.push(commit.clone());
+            }
+        }
+        if !still_missing_base.is_empty() {
+            self.fetch_commits(&remote_name, &still_missing_base)
+                .await?;
+        }
+
+        for commit in &all_missing {
             if !self.is_present(commit).await {
                 return Err(PermanentFetchError(format!(
                     "commit {} still missing after fetch from {}",
@@ -836,15 +905,21 @@ impl FetchWorker {
     /// Pre-fetch objects for a batch of rows in a single `git fetch` call.
     /// Groups rows by remote URL and fetches all missing SHAs together so
     /// the server can compute one optimal pack.
+    ///
+    /// Remotes where fewer than two rows have missing commits are skipped so a
+    /// single failing row is not fetched twice back-to-back (once in
+    /// `batch_prefetch` and immediately again in `ensure_present`).
     async fn batch_prefetch(&self, rows: &[FetchQueueRow]) {
-        // Remotes where fewer than two rows have missing commits are skipped so
-        // a single failing row is not fetched twice back-to-back (once in
-        // batch_prefetch and immediately again in ensure_present).
         if rows.len() < 2 {
             return;
         }
 
-        // Group missing SHAs and contributing row count by remote URL.
+        // Group missing primary (head) SHAs and contributing row count by
+        // remote URL. For commit ranges (base..head, base...head), only
+        // prefetch head: fetching head brings ancestor base commits
+        // automatically in the packfile without forcing the remote into a
+        // non-tip reachability scan for base. Any divergent base still missing
+        // after prefetch is fetched by ensure_present.
         let mut by_remote: std::collections::HashMap<String, (usize, Vec<String>)> =
             std::collections::HashMap::new();
         for row in rows {
@@ -852,8 +927,8 @@ impl FetchWorker {
             if url.is_empty() {
                 continue;
             }
-            let mut commits = match parse_commit_range_endpoints(&row.commit_hash) {
-                Ok(c) => c,
+            let mut commits = match parse_commit_range_phases(&row.commit_hash) {
+                Ok((head, _base)) => vec![head],
                 Err(e) => {
                     warn!(
                         "batch_prefetch: skipping invalid range in row {}: {}",
@@ -863,8 +938,8 @@ impl FetchWorker {
                 }
             };
             for sha in &row.supporting_commits {
-                match parse_commit_range_endpoints(sha) {
-                    Ok(c) => commits.extend(c),
+                match parse_commit_range_phases(sha) {
+                    Ok((head, _base)) => commits.push(head),
                     Err(e) => {
                         warn!(
                             "batch_prefetch: skipping invalid supporting commit in row {}: {}",
@@ -1804,6 +1879,116 @@ mod tests {
             err
         );
         assert!(err.to_string().contains("exceeding maximum of 256"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_ensure_present_fetches_range_head_before_base() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let remote_path = temp_dir.path().join("remote");
+        let local_path = temp_dir.path().join("local");
+        std::fs::create_dir_all(&remote_path)?;
+        std::fs::create_dir_all(&local_path)?;
+
+        // Configure remote so only ref tips may be requested in `want` lines
+        // (matching servers that disable allowReachableSHA1InWant or where
+        // non-tip reachability walks time out).
+        crate::git_cmd::in_dir_async(&remote_path)
+            .args(["init", "-b", "main"])
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(&remote_path)
+            .args(["config", "user.name", "Test User"])
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(&remote_path)
+            .args(["config", "user.email", "test@example.com"])
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(&remote_path)
+            .args(["config", "uploadpack.allowTipSHA1InWant", "true"])
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(&remote_path)
+            .args(["config", "uploadpack.allowReachableSHA1InWant", "false"])
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(&remote_path)
+            .args(["config", "uploadpack.allowAnySHA1InWant", "false"])
+            .output()
+            .await?;
+
+        std::fs::write(remote_path.join("file.txt"), "base\n")?;
+        crate::git_cmd::in_dir_async(&remote_path)
+            .args(["add", "."])
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(&remote_path)
+            .args(["commit", "-m", "base commit"])
+            .output()
+            .await?;
+        let base_sha = String::from_utf8(
+            crate::git_cmd::in_dir_async(&remote_path)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .await?
+                .stdout,
+        )?
+        .trim()
+        .to_string();
+
+        std::fs::write(remote_path.join("file.txt"), "head\n")?;
+        crate::git_cmd::in_dir_async(&remote_path)
+            .args(["add", "."])
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(&remote_path)
+            .args(["commit", "-m", "head commit"])
+            .output()
+            .await?;
+        let head_sha = String::from_utf8(
+            crate::git_cmd::in_dir_async(&remote_path)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .await?
+                .stdout,
+        )?
+        .trim()
+        .to_string();
+
+        crate::git_cmd::in_dir_async(&local_path)
+            .args(["init", "-b", "main"])
+            .output()
+            .await?;
+        let worker = test_worker(local_path).await;
+
+        let remote_url = format!("file://{}", remote_path.display());
+        let row = FetchQueueRow {
+            id: 1,
+            patchset_id: None,
+            cover_letter_message_id: None,
+            repo_url: Some(remote_url),
+            commit_hash: format!("{}..{}", base_sha, head_sha),
+            mr_url: None,
+            mr_title: None,
+            mr_number: None,
+            status: crate::db::FetchStatus::Fetching,
+            attempts: 1,
+            first_attempt_at: None,
+            next_retry_at: None,
+            locked_at: None,
+            last_error: None,
+            priority: 500,
+            created_at: 0,
+            supporting_commits: Vec::new(),
+        };
+
+        // Fetching head first brings base in the packfile without ever sending
+        // `want <base_sha>` to the remote.
+        worker.ensure_present(&row).await?;
+        assert!(worker.is_present(&base_sha).await);
+        assert!(worker.is_present(&head_sha).await);
 
         Ok(())
     }
