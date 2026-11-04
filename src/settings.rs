@@ -1245,6 +1245,29 @@ impl Default for GitSettings {
     }
 }
 
+impl GitSettings {
+    /// Look up the configured custom remote matching `url`, if any.
+    pub fn custom_remote_for_url(&self, url: &str) -> Option<&CustomRemoteSettings> {
+        self.custom_remotes.as_ref()?.iter().find(|r| {
+            crate::git_ops::is_safe_remote_name(&r.name) && crate::git_ops::urls_match(&r.url, url)
+        })
+    }
+
+    /// Resolve the fetch queue priority for `repo_url` (`DEFAULT_PRIORITY` if
+    /// no matching custom remote specifies `fetch_priority`).
+    pub fn fetch_priority_for_url(&self, repo_url: Option<&str>) -> i32 {
+        repo_url
+            .and_then(|u| self.custom_remote_for_url(u))
+            .and_then(|r| r.fetch_priority)
+            .map(|p| p.clamp(MIN_PRIORITY, MAX_PRIORITY))
+            .unwrap_or(DEFAULT_PRIORITY)
+    }
+}
+
+pub const MIN_PRIORITY: i32 = 1;
+pub const MAX_PRIORITY: i32 = 999;
+pub const DEFAULT_PRIORITY: i32 = 500;
+
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BatchTier {
@@ -2822,5 +2845,108 @@ mod tests {
         let settings = Settings::load(Some(&path)).unwrap();
         let err = settings.validate_for_daemon().unwrap_err();
         assert!(err.contains("[review.priority_rules] invalid regex"));
+    }
+
+    #[test]
+    fn test_git_fetch_and_custom_remotes_deserialize_toml_and_env_map() {
+        let toml_base = r#"
+[git]
+repository_path = "third_party/linux"
+"#;
+        let cfg = config::Config::builder()
+            .add_source(config::File::from_str(toml_base, config::FileFormat::Toml))
+            .set_override("git.fetch.batch_size", 1)
+            .expect("set override")
+            .set_override("git.fetch.protocol_v2", true)
+            .expect("set override")
+            .set_override("git.fetch.max_retained_tips", 250)
+            .expect("set override")
+            .set_override("git.fetch.use_range_base_as_tip", true)
+            .expect("set override")
+            .set_override("git.custom_remotes.0.name", "icebreaker")
+            .expect("set override")
+            .set_override(
+                "git.custom_remotes.0.url",
+                "sso://prodkernel/kernel/icebreaker",
+            )
+            .expect("set override")
+            .set_override(
+                "git.custom_remotes.0.fetch_refspecs",
+                "+refs/heads/*/next:refs/remotes/icebreaker/*/next,+refs/heads/*/release:refs/remotes/icebreaker/*/release",
+            )
+            .expect("set override")
+            .set_override(
+                "git.custom_remotes.0.negotiation_tips",
+                "refs/remotes/icebreaker/*,refs/sashiko/fetched/icebreaker/*",
+            )
+            .expect("set override")
+            .set_override("git.custom_remotes.1.name", "builds")
+            .expect("set override")
+            .set_override("git.custom_remotes.1.url", "sso://prodkernel/builds")
+            .expect("set override")
+            .set_override("git.custom_remotes.1.fetch_priority", 400)
+            .expect("set override")
+            .set_override("git.custom_remotes.1.commit_ref_prefix", "refs/builds/")
+            .expect("set override")
+            .set_override("git.fetch.concurrency", 2)
+            .expect("set override")
+            .build()
+            .expect("build config");
+
+        #[derive(Debug, Deserialize)]
+        struct GitWrapper {
+            git: GitSettings,
+        }
+
+        let wrapper: GitWrapper = cfg.try_deserialize().expect("deserialize git settings");
+        assert_eq!(wrapper.git.fetch.batch_size, 1);
+        assert_eq!(wrapper.git.fetch.concurrency, 2);
+        assert!(wrapper.git.fetch.protocol_v2);
+        assert_eq!(wrapper.git.fetch.max_retained_tips, 250);
+        assert!(wrapper.git.fetch.use_range_base_as_tip);
+        assert_eq!(
+            wrapper
+                .git
+                .fetch_priority_for_url(Some("https://prodkernel.googlesource.com/builds.git")),
+            400
+        );
+        assert_eq!(
+            wrapper
+                .git
+                .fetch_priority_for_url(Some("sso://prodkernel/kernel/icebreaker")),
+            500
+        );
+
+        let remotes = wrapper.git.custom_remotes.expect("custom remotes");
+        assert_eq!(remotes.len(), 2);
+        assert_eq!(remotes[0].name, "icebreaker");
+        assert!(remotes[0].commit_ref_prefix.is_none());
+        assert_eq!(
+            remotes[1].commit_ref_prefix.as_deref(),
+            Some("refs/builds/")
+        );
+        assert!(!remotes[0].check_all_branches);
+        assert_eq!(
+            remotes[0].fetch_refspecs.as_deref(),
+            Some(
+                [
+                    "+refs/heads/*/next:refs/remotes/icebreaker/*/next".to_string(),
+                    "+refs/heads/*/release:refs/remotes/icebreaker/*/release".to_string()
+                ]
+                .as_slice()
+            )
+        );
+        assert_eq!(
+            remotes[0].negotiation_tips.as_deref(),
+            Some(
+                [
+                    "refs/remotes/icebreaker/*".to_string(),
+                    "refs/sashiko/fetched/icebreaker/*".to_string()
+                ]
+                .as_slice()
+            )
+        );
+        assert_eq!(remotes[1].name, "builds");
+        assert_eq!(remotes[1].fetch_refspecs, None);
     }
 }
