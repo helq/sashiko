@@ -3111,7 +3111,7 @@ impl Database {
             .await?;
         }
 
-        info!("Database schema is up to date at version 19.");
+        info!("Database schema is up to date at version 20.");
 
         Ok(())
     }
