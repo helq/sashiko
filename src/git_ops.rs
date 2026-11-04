@@ -1078,7 +1078,7 @@ impl Drop for GitWorktree {
     }
 }
 
-fn get_remote_lock(name: &str) -> Arc<AsyncMutex<()>> {
+pub fn get_remote_lock(name: &str) -> Arc<AsyncMutex<()>> {
     static LOCKS: OnceLock<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>> = OnceLock::new();
     let map_mutex = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = map_mutex.lock().unwrap();
@@ -1090,7 +1090,7 @@ fn get_remote_lock(name: &str) -> Arc<AsyncMutex<()>> {
         .clone()
 }
 
-fn get_global_config_lock() -> Arc<AsyncMutex<()>> {
+pub fn get_global_config_lock() -> Arc<AsyncMutex<()>> {
     static GLOBAL_LOCK: OnceLock<Arc<AsyncMutex<()>>> = OnceLock::new();
     GLOBAL_LOCK
         .get_or_init(|| Arc::new(AsyncMutex::new(())))
@@ -1150,6 +1150,144 @@ pub fn is_stale_commit_graph(message: &str) -> bool {
 /// was, and the graph outlives the cycle.
 const GRAPH_RETRY_FLOOR: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Normalize a Git repository URL so equivalent `sso://` and
+/// `https://*.googlesource.com` / `https://*.git.corp.google.com` forms match.
+pub fn canonicalize_git_url(url: &str) -> String {
+    let trimmed = url.trim().trim_end_matches('/');
+    let trimmed = trimmed
+        .strip_suffix(".git")
+        .unwrap_or(trimmed)
+        .trim_end_matches('/');
+
+    if let Some(rest) = trimmed.strip_prefix("sso://")
+        && let Some((host, path)) = rest.split_once('/')
+    {
+        let short_host = host.to_ascii_lowercase();
+        let clean_path = path.trim_matches('/');
+        if !short_host.is_empty() && !short_host.contains('.') && !clean_path.is_empty() {
+            return format!("googlesource://{}/{}", short_host, clean_path);
+        }
+    }
+
+    if let Some(rest) = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        && let Some((host, path)) = rest.split_once('/')
+    {
+        let lower_host = host.to_ascii_lowercase();
+        let clean_path = path.trim_matches('/');
+        if let Some(short_host) = lower_host
+            .strip_suffix(".googlesource.com")
+            .or_else(|| lower_host.strip_suffix(".git.corp.google.com"))
+            && !short_host.is_empty()
+            && !short_host.contains('.')
+            && !clean_path.is_empty()
+        {
+            return format!("googlesource://{}/{}", short_host, clean_path);
+        }
+        return format!("https://{}/{}", lower_host, clean_path);
+    }
+
+    trimmed.to_string()
+}
+
+/// Returns true when two Git URLs refer to the same logical remote repository.
+pub fn urls_match(a: &str, b: &str) -> bool {
+    let ca = canonicalize_git_url(a);
+    let cb = canonicalize_git_url(b);
+    !ca.is_empty() && ca == cb
+}
+
+/// Returns true when `name` is a safe single-component Git remote name.
+pub fn is_safe_remote_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('-')
+        && !name.starts_with('.')
+        && !name.ends_with('.')
+        && !name.contains("..")
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// Synchronize `remote.<name>.fetch` entries in `.git/config` with
+/// `desired_refspecs`. Caller must hold [`get_global_config_lock`].
+pub async fn sync_remote_fetch_refspecs(
+    repo_path: &Path,
+    name: &str,
+    desired_refspecs: &[String],
+) -> Result<()> {
+    let valid_specs: Vec<&str> = desired_refspecs
+        .iter()
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|s| {
+            !s.is_empty()
+                && !s.starts_with('-')
+                && !s.chars().any(char::is_whitespace)
+                && s.contains(':')
+        })
+        .collect();
+    if valid_specs.is_empty() {
+        return Ok(());
+    }
+
+    let key = format!("remote.{}.fetch", name);
+    let get_out = crate::git_cmd::in_dir_async(repo_path)
+        .args(["-c", "safe.bareRepository=all"])
+        .args(["config", "--get-all", &key])
+        .output()
+        .await?;
+
+    let existing: Vec<String> = if get_out.status.success() {
+        String::from_utf8_lossy(&get_out.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(ToString::to_string)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    if existing.len() == valid_specs.len()
+        && existing
+            .iter()
+            .zip(valid_specs.iter())
+            .all(|(a, b)| a == *b)
+    {
+        return Ok(());
+    }
+
+    info!(
+        "Updating fetch refspecs for remote {} to {:?}",
+        name, valid_specs
+    );
+    let _ = crate::git_cmd::in_dir_async(repo_path)
+        .args(["-c", "safe.bareRepository=all"])
+        .args(["config", "--unset-all", &key])
+        .output()
+        .await;
+
+    for spec in valid_specs {
+        let add_out = crate::git_cmd::in_dir_async(repo_path)
+            .args(["-c", "safe.bareRepository=all"])
+            .args(["config", "--add", &key, spec])
+            .output()
+            .await?;
+        if !add_out.status.success() {
+            return Err(anyhow!(
+                "Failed to set fetch refspec '{}' for remote {}: {}",
+                spec,
+                name,
+                redact_secret(String::from_utf8_lossy(&add_out.stderr).trim())
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Runs one fetch, returning git's complaint rather than an error
 /// value, since the caller decides which failures are worth a retry.
 async fn fetch_remote(
@@ -1159,6 +1297,7 @@ async fn fetch_remote(
     timeout: std::time::Duration,
 ) -> std::result::Result<(), String> {
     let fetch_future = crate::git_cmd::in_dir_async(repo_path)
+        .args(["-c", "protocol.version=2"])
         .args(GIT_PROTOCOL_RESTRICTIONS)
         .args(args)
         .kill_on_drop(true)
@@ -1256,6 +1395,16 @@ pub async fn refresh_remote(
     url: &str,
     force_fetch: bool,
 ) -> Result<FetchOutcome> {
+    refresh_remote_with_refspecs(repo_path, name, url, None, force_fetch).await
+}
+
+async fn refresh_remote_with_refspecs(
+    repo_path: &Path,
+    name: &str,
+    url: &str,
+    fetch_refspecs: Option<&[String]>,
+    force_fetch: bool,
+) -> Result<FetchOutcome> {
     // 1. Validate repo_path to prevent git from traversing up to parent repos
     if !repo_path.join(".git").exists() && !repo_path.join("HEAD").exists() {
         return Err(anyhow::anyhow!(
@@ -1318,6 +1467,10 @@ pub async fn refresh_remote(
             }
             just_added = true;
         }
+
+        if let Some(specs) = fetch_refspecs {
+            sync_remote_fetch_refspecs(repo_path, name, specs).await?;
+        }
     } // Release global lock
 
     // 3. Lazy Fetch Check
@@ -1343,14 +1496,28 @@ pub async fn refresh_remote(
         None => false,
     };
 
-    // Check if HEAD exists
+    // Check if HEAD or any remote-tracking ref exists
     let head_ref = format!("refs/remotes/{}/HEAD", name);
-    let head_exists = crate::git_cmd::in_dir_async(repo_path)
+    let mut head_exists = crate::git_cmd::in_dir_async(repo_path)
         .args(["show-ref", "--verify", "-q", &head_ref])
         .status()
         .await
         .map(|s| s.success())
         .unwrap_or(false);
+    if !head_exists {
+        let remotes_prefix = format!("refs/remotes/{}/", name);
+        head_exists = crate::git_cmd::in_dir_async(repo_path)
+            .args([
+                "for-each-ref",
+                "--count=1",
+                "--format=%(refname)",
+                &remotes_prefix,
+            ])
+            .output()
+            .await
+            .map(|o| o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+            .unwrap_or(false);
+    }
 
     // The local ref stands in for a fetch that fails, or is backed
     // off, only while it is recent enough.
@@ -1487,19 +1654,48 @@ pub async fn refresh_remote(
         }
     }
 
-    // Ensure HEAD is set correctly (if we fetched successfully)
+    // Ensure HEAD is set correctly (if we fetched successfully).
+    // Custom narrow fetch_refspecs do not fetch the remote's default HEAD
+    // branch, and `git remote set-head <name> --auto` sends an unfiltered
+    // `ls-refs` over the network (which stalls on remotes with hundreds of
+    // thousands of non-branch refs), so only query the remote when default
+    // refspecs are used.
     if should_fetch && fetch_ok {
         // Requires global config lock
         let global_lock = get_global_config_lock();
         let _global_guard = global_lock.lock().await;
 
-        let set_head = crate::git_cmd::in_dir_async(repo_path)
-            .args(GIT_PROTOCOL_RESTRICTIONS)
-            .args(["remote", "set-head", name, "--auto"])
-            .output()
-            .await?;
+        let auto_ok = if fetch_refspecs.is_none() {
+            let set_head_fut = crate::git_cmd::in_dir_async(repo_path)
+                .args(["-c", "protocol.version=2"])
+                .args(GIT_PROTOCOL_RESTRICTIONS)
+                .args(["remote", "set-head", name, "--auto"])
+                .kill_on_drop(true)
+                .output();
+            match tokio::time::timeout(std::time::Duration::from_secs(15), set_head_fut).await {
+                Ok(Ok(out)) if out.status.success() => true,
+                Ok(Ok(out)) => {
+                    tracing::debug!(
+                        "Could not auto-set default HEAD for remote {}: {}",
+                        name,
+                        redact_secret(String::from_utf8_lossy(&out.stderr).trim())
+                    );
+                    false
+                }
+                Ok(Err(e)) => {
+                    tracing::debug!("Failed to run remote set-head --auto for {}: {}", name, e);
+                    false
+                }
+                Err(_) => {
+                    tracing::debug!("Timed out running remote set-head --auto for {}", name);
+                    false
+                }
+            }
+        } else {
+            false
+        };
 
-        if !set_head.status.success() {
+        if !auto_ok {
             // Try common default branch names if --auto could not determine HEAD
             let mut head_resolved = false;
             for branch in ["master", "main", "for-next", "for-linus"] {
@@ -1525,11 +1721,7 @@ pub async fn refresh_remote(
             }
 
             if !head_resolved {
-                tracing::debug!(
-                    "Could not set default HEAD for remote {}: {}",
-                    name,
-                    redact_secret(String::from_utf8_lossy(&set_head.stderr).trim())
-                );
+                tracing::debug!("No local default HEAD branch found for remote {}", name);
             }
         }
 
@@ -1737,11 +1929,20 @@ pub struct PatchMetadata {
 
 /// Resolve a git range (e.g. "HEAD~3..HEAD") to an ordered list of commit SHAs.
 pub async fn resolve_git_range(repo_path: &Path, range: &str) -> Result<Vec<String>> {
-    let output = crate::git_cmd::in_dir_async(repo_path)
-        .args(["-c", "safe.bareRepository=all"])
-        .args(["rev-list", "--reverse", range])
-        .output()
-        .await?;
+    resolve_git_range_bounded(repo_path, range, None).await
+}
+
+pub async fn resolve_git_range_bounded(
+    repo_path: &Path,
+    range: &str,
+    max_count: Option<usize>,
+) -> Result<Vec<String>> {
+    let mut cmd = crate::git_cmd::in_dir_async(repo_path);
+    cmd.args(["-c", "safe.bareRepository=all", "rev-list", "--reverse"]);
+    if let Some(max) = max_count {
+        cmd.arg(format!("--max-count={}", max));
+    }
+    let output = cmd.arg(range).output().await?;
 
     if !output.status.success() {
         return Err(anyhow!(
@@ -2726,6 +2927,70 @@ mod tests {
             !set_url_err.contains("secret_token_123"),
             "leaked secret token in error: {set_url_err}"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_canonicalize_git_url_and_urls_match() {
+        assert!(urls_match(
+            "sso://prodkernel/kernel/icebreaker",
+            "https://prodkernel.googlesource.com/kernel/icebreaker.git"
+        ));
+        assert!(urls_match(
+            "sso://prodkernel/builds/",
+            "https://prodkernel.googlesource.com/builds"
+        ));
+        assert!(!urls_match(
+            "sso://prodkernel/kernel/icebreaker",
+            "sso://prodkernel/builds"
+        ));
+        assert!(is_safe_remote_name("icebreaker"));
+        assert!(is_safe_remote_name("fetcher-abc123"));
+        assert!(!is_safe_remote_name("-bad"));
+        assert!(!is_safe_remote_name("a..b"));
+        assert!(!is_safe_remote_name("a/b"));
+    }
+
+    #[tokio::test]
+    async fn test_sync_remote_fetch_refspecs() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let repo_path = dir.path().to_path_buf();
+
+        crate::git_cmd::in_dir_async(&repo_path)
+            .args(["init"])
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(&repo_path)
+            .args([
+                "remote",
+                "add",
+                "icebreaker",
+                "https://example.com/icebreaker.git",
+            ])
+            .output()
+            .await?;
+
+        let desired = vec![
+            "+refs/heads/*/next:refs/remotes/icebreaker/*/next".to_string(),
+            "+refs/heads/*/release:refs/remotes/icebreaker/*/release".to_string(),
+        ];
+        {
+            let lock = get_global_config_lock();
+            let _guard = lock.lock().await;
+            sync_remote_fetch_refspecs(&repo_path, "icebreaker", &desired).await?;
+        }
+
+        let out = crate::git_cmd::in_dir_async(&repo_path)
+            .args(["config", "--get-all", "remote.icebreaker.fetch"])
+            .output()
+            .await?;
+        let configured: Vec<String> = String::from_utf8(out.stdout)?
+            .lines()
+            .map(str::trim)
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(configured, desired);
 
         Ok(())
     }
