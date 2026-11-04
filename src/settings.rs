@@ -1009,14 +1009,215 @@ fn is_reachable_base_url(url: &str) -> bool {
     )
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct CustomRemoteSettings {
     pub name: String,
     pub url: String,
+    #[serde(default)]
     pub check_all_branches: bool,
+    #[serde(default, deserialize_with = "deserialize_opt_string_or_vec")]
     pub only_branches: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_opt_string_or_vec")]
+    pub fetch_refspecs: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_opt_string_or_vec")]
+    pub negotiation_tips: Option<Vec<String>>,
+    #[serde(default)]
+    pub fetch_priority: Option<i32>,
+    #[serde(default)]
+    pub commit_ref_prefix: Option<String>,
+}
+
+fn default_fetch_batch_size() -> usize {
+    1
+}
+
+fn default_fetch_concurrency() -> usize {
+    1
+}
+
+fn default_max_retained_tips() -> usize {
+    200
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[allow(unused)]
+pub struct GitFetchSettings {
+    #[serde(default = "default_fetch_batch_size")]
+    pub batch_size: usize,
+    #[serde(default = "default_fetch_concurrency")]
+    pub concurrency: usize,
+    #[serde(default = "default_true")]
+    pub protocol_v2: bool,
+    #[serde(default = "default_max_retained_tips")]
+    pub max_retained_tips: usize,
+    #[serde(default = "default_true")]
+    pub use_range_base_as_tip: bool,
+}
+
+impl Default for GitFetchSettings {
+    fn default() -> Self {
+        Self {
+            batch_size: default_fetch_batch_size(),
+            concurrency: default_fetch_concurrency(),
+            protocol_v2: true,
+            max_retained_tips: default_max_retained_tips(),
+            use_range_base_as_tip: true,
+        }
+    }
+}
+
+/// Deserialize an optional list of strings that may arrive as `None`, a
+/// comma-separated string (from env vars), a sequence (from TOML `[...]`), or
+/// an indexed map (from `SASHIKO__*__0` env vars).
+fn deserialize_opt_string_or_vec<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct OptStringOrVecVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for OptStringOrVecVisitor {
+        type Value = Option<Vec<String>>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("null, a comma-separated string, a sequence, or an indexed map of strings")
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_any(OptStringOrVecVisitor)
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            let vec: Vec<String> = value
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            Ok(Some(vec))
+        }
+
+        fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
+        where
+            S: serde::de::SeqAccess<'de>,
+        {
+            let mut vec = Vec::new();
+            while let Some(elem) = seq.next_element::<String>()? {
+                let trimmed = elem.trim();
+                if !trimmed.is_empty() {
+                    vec.push(trimmed.to_string());
+                }
+            }
+            Ok(Some(vec))
+        }
+
+        fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+        where
+            M: serde::de::MapAccess<'de>,
+        {
+            use std::collections::BTreeMap;
+            let mut btree = BTreeMap::new();
+            while let Some(key) = map.next_key::<String>()? {
+                let value = map.next_value::<String>()?;
+                let idx: usize = key.parse().map_err(serde::de::Error::custom)?;
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    btree.insert(idx, trimmed.to_string());
+                }
+            }
+            Ok(Some(btree.into_values().collect()))
+        }
+    }
+
+    deserializer.deserialize_any(OptStringOrVecVisitor)
+}
+
+/// Deserialize an `Option<Vec<T>>` that may arrive as `None`, a sequence (from
+/// TOML `[[...]]`), or a map of numeric-string indices to values (from env vars
+/// via the `config` crate, e.g. `SASHIKO__GIT__CUSTOM_REMOTES__0__NAME`).
+fn deserialize_opt_indexed_vec<'de, D, T>(deserializer: D) -> Result<Option<Vec<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    struct OptIndexedVecVisitor<T>(std::marker::PhantomData<T>);
+
+    impl<'de, T: serde::Deserialize<'de>> serde::de::Visitor<'de> for OptIndexedVecVisitor<T> {
+        type Value = Option<Vec<T>>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("null, a sequence, or a map of indices to values")
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_any(OptIndexedVecVisitor(std::marker::PhantomData))
+        }
+
+        fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
+        where
+            S: serde::de::SeqAccess<'de>,
+        {
+            let mut vec = Vec::new();
+            while let Some(elem) = seq.next_element()? {
+                vec.push(elem);
+            }
+            Ok(Some(vec))
+        }
+
+        fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+        where
+            M: serde::de::MapAccess<'de>,
+        {
+            use std::collections::BTreeMap;
+            let mut btree = BTreeMap::new();
+            while let Some(key) = map.next_key::<String>()? {
+                let value = map.next_value::<T>()?;
+                let idx: usize = key.parse().map_err(serde::de::Error::custom)?;
+                btree.insert(idx, value);
+            }
+            Ok(Some(btree.into_values().collect()))
+        }
+    }
+
+    deserializer.deserialize_any(OptIndexedVecVisitor(std::marker::PhantomData))
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1025,7 +1226,10 @@ pub struct CustomRemoteSettings {
 pub struct GitSettings {
     #[serde(default)]
     pub repository_path: String,
+    #[serde(default, deserialize_with = "deserialize_opt_indexed_vec")]
     pub custom_remotes: Option<Vec<CustomRemoteSettings>>,
+    #[serde(default)]
+    pub fetch: GitFetchSettings,
 }
 
 /// No repository. A local review has none to configure, since it reviews the
@@ -1036,6 +1240,7 @@ impl Default for GitSettings {
         Self {
             repository_path: String::new(),
             custom_remotes: None,
+            fetch: GitFetchSettings::default(),
         }
     }
 }
