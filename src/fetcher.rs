@@ -2818,4 +2818,83 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn test_commit_hash_from_placeholder() {
+        assert_eq!(
+            commit_hash_from_placeholder("abc123@sashiko.local"),
+            "abc123"
+        );
+        assert_eq!(
+            commit_hash_from_placeholder("mr-42-base..head"),
+            "base..head"
+        );
+        assert_eq!(
+            commit_hash_from_placeholder("mr-42-base..head@sashiko.local"),
+            "base..head"
+        );
+        assert_eq!(
+            commit_hash_from_placeholder("feature@v2@sashiko.local"),
+            "feature@v2"
+        );
+        assert_eq!(commit_hash_from_placeholder("feature@v2"), "feature@v2");
+        assert_eq!(
+            commit_hash_from_placeholder("mr-42-feat@v1..feat@v2@sashiko.local"),
+            "feat@v1..feat@v2"
+        );
+        assert_eq!(commit_hash_from_placeholder("plainsha"), "plainsha");
+    }
+
+    #[test]
+    fn test_backoff_secs_is_exponential_and_capped() {
+        assert_eq!(backoff_secs(1), 30);
+        assert_eq!(backoff_secs(2), 60);
+        assert_eq!(backoff_secs(3), 120);
+        assert_eq!(backoff_secs(4), 240);
+        assert_eq!(backoff_secs(5), 480);
+        assert_eq!(backoff_secs(6), 600);
+        assert_eq!(backoff_secs(100), 600);
+    }
+
+    #[test]
+    fn test_looks_like_object_id() {
+        assert!(looks_like_object_id(&"a".repeat(40)));
+        assert!(looks_like_object_id(&"0".repeat(64)));
+        assert!(looks_like_object_id(
+            "8a21aa5149b3f34f48a277d596d1ffe512b32a41"
+        ));
+        assert!(!looks_like_object_id("main"));
+        assert!(!looks_like_object_id("v6.10"));
+        assert!(!looks_like_object_id("refs/heads/main"));
+        assert!(!looks_like_object_id(&"a".repeat(39)));
+        assert!(!looks_like_object_id("zzzz"));
+    }
+
+    #[test]
+    fn test_parse_commit_range_endpoints() {
+        assert_eq!(
+            parse_commit_range_endpoints("abc1234").unwrap(),
+            vec!["abc1234"]
+        );
+        assert_eq!(
+            parse_commit_range_endpoints("v1.0..v2.0").unwrap(),
+            vec!["v1.0", "v2.0"]
+        );
+        assert_eq!(
+            parse_commit_range_endpoints("v1.0...v2.0").unwrap(),
+            vec!["v1.0", "v2.0"]
+        );
+        assert!(parse_commit_range_endpoints("").is_err());
+        assert!(parse_commit_range_endpoints("..head").is_err());
+        assert!(parse_commit_range_endpoints("base..").is_err());
+        assert!(parse_commit_range_endpoints("...head").is_err());
+        assert!(parse_commit_range_endpoints("base...").is_err());
+    }
+
+    #[test]
+    fn test_handle_failure_detects_wrapped_permanent_fetch_error() {
+        let err: anyhow::Error = PermanentFetchError("fatal error".to_string()).into();
+        let wrapped = err.context("extract failed");
+        assert!(wrapped.chain().any(|e| e.is::<PermanentFetchError>()));
+    }
 }
