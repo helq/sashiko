@@ -6375,8 +6375,8 @@ F:	*
             .unwrap()
             .expect("fetch_queue row should be persisted");
         assert_eq!(
-            locked.repo_url,
-            "https://github.com/sashiko-dev/sashiko.git"
+            locked.repo_url.as_deref(),
+            Some("https://github.com/sashiko-dev/sashiko.git")
         );
         assert_eq!(
             locked.commit_range,

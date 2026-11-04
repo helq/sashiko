@@ -341,7 +341,8 @@ impl FetchAgent {
         }
 
         if !missing_commits.is_empty() {
-            if row.repo_url.is_empty() || self.is_local_repo_url(&row.repo_url).await {
+            let repo_url = row.repo_url.as_deref().unwrap_or("");
+            if repo_url.is_empty() || self.is_local_repo_url(repo_url).await {
                 let err_msg = format!(
                     "Local repository missing commits for {}: {:?}",
                     row.article_id, missing_commits
@@ -351,10 +352,10 @@ impl FetchAgent {
                 return;
             }
 
-            let url_display = redact_secret(&row.repo_url);
-            let remote_name = self.get_remote_name(&row.repo_url);
+            let url_display = redact_secret(repo_url);
+            let remote_name = self.get_remote_name(repo_url);
 
-            if let Err(e) = self.ensure_remote(&remote_name, &row.repo_url).await {
+            if let Err(e) = self.ensure_remote(&remote_name, repo_url).await {
                 let err_msg = format!(
                     "Failed to set up remote {}: {}",
                     url_display,

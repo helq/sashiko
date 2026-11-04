@@ -1612,21 +1612,100 @@ pub struct ForgeOutboxRow {
     pub created_at: i64,
 }
 
+/// Status of an entry in the fetch queue.
+///
+/// Stored as TEXT in SQLite with a CHECK constraint limiting values
+/// to the three valid states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchStatus {
+    Pending,
+    Fetching,
+    Failed,
+    Cancelled,
+}
+
+impl FetchStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "Pending",
+            Self::Fetching => "Fetching",
+            Self::Failed => "Failed",
+            Self::Cancelled => "Cancelled",
+        }
+    }
+}
+
+impl std::fmt::Display for FetchStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for FetchStatus {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "Pending" => Ok(Self::Pending),
+            "Fetching" => Ok(Self::Fetching),
+            "Failed" => Ok(Self::Failed),
+            "Cancelled" => Ok(Self::Cancelled),
+            other => Err(anyhow::anyhow!("unknown FetchStatus: {}", other)),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FetchQueueRow {
     pub id: i64,
-    pub repo_url: String,
+    pub patchset_id: Option<i64>,
+    pub cover_letter_message_id: Option<String>,
+    pub repo_url: Option<String>,
+    pub commit_hash: String,
     pub commit_range: String,
     pub article_id: String,
     pub mr_url: Option<String>,
     pub mr_title: Option<String>,
     pub mr_number: Option<i64>,
-    pub status: String,
-    pub locked_at: Option<i64>,
+    pub status: FetchStatus,
+    pub attempts: i64,
     pub retry_count: i64,
+    pub first_attempt_at: Option<i64>,
     pub next_retry_at: Option<i64>,
+    pub locked_at: Option<i64>,
+    pub last_error: Option<String>,
     pub error_log: Option<String>,
+    pub priority: i64,
     pub created_at: i64,
+    /// Extra commit SHAs that must be present locally for the review to hydrate
+    /// its context, but are never ingested as patches. Loaded from the
+    /// `fetch_supporting_commits` table. Used by cherry-pick reviews to carry
+    /// the original and base commits.
+    pub supporting_commits: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StuckFetchPlaceholder {
+    pub patchset_id: i64,
+    pub cover_letter_message_id: Option<String>,
+    pub repo_url: Option<String>,
+    pub mr_url: Option<String>,
+    pub mr_title: Option<String>,
+    pub mr_number: Option<i64>,
+    pub priority: i64,
+}
+
+/// Recover a fetch source URL from a placeholder subject of the form
+/// "Fetching <rev> from <url>...". Returns None when the subject carries no URL
+/// source (e.g. a local fetch, or a thread/PR placeholder).
+#[cfg(all(test, feature = "server"))]
+fn repo_url_from_subject(subject: &str) -> Option<String> {
+    let after = subject.split_once(" from ")?.1;
+    let url = after.strip_suffix("...").unwrap_or(after).trim();
+    if url.is_empty() || url == "local" {
+        None
+    } else {
+        Some(url.to_string())
+    }
 }
 
 /// Maximum age of a predecessor linked only by its subject for the new
@@ -1974,7 +2053,6 @@ fn same_author_email(a: &str, b: &str) -> bool {
         && email_b.contains('@')
         && (email_a.eq_ignore_ascii_case(&email_b) || crate::patch::authors_match(a, b))
 }
-
 #[cfg(feature = "server")]
 impl Database {
     pub fn has_bug_actor(&self) -> bool {
@@ -2924,6 +3002,19 @@ impl Database {
                 );
                 tx.rollback().await?;
             } else {
+                let has_repo_url = {
+                    let mut columns = tx.query("PRAGMA table_info(patchsets)", ()).await?;
+                    let mut found = false;
+                    while let Some(row) = columns.next().await? {
+                        let name: String = row.get(1)?;
+                        found |= name == "repo_url";
+                    }
+                    found
+                };
+                if !has_repo_url {
+                    tx.execute("ALTER TABLE patchsets ADD COLUMN repo_url TEXT", ())
+                        .await?;
+                }
                 tx.execute_batch(include_str!("migrations/016_fetch_queue.sql"))
                     .await?;
                 tx.execute("PRAGMA user_version = 16", ()).await?;
@@ -13898,6 +13989,281 @@ impl Database {
         self.rerun_patchset(patchset_id).await
     }
 
+    // --- Durable fetch queue -------------------------------------------------
+    //
+    // These operations back the FetchWorker. They mirror the patchwork_outbox
+    // pattern: work is claimed under a lease (locked_at), retried with backoff
+    // (next_retry_at), completed, terminally failed, or reclaimed by a ghost
+    // sweep when a worker dies mid-flight.
+
+    /// Enqueue a git fetch. Idempotent: an active (Pending/Fetching) row for the
+    /// same commit and repo is left untouched so duplicate submissions collapse.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn enqueue_fetch(
+        &self,
+        patchset_id: Option<i64>,
+        cover_letter_message_id: Option<&str>,
+        repo_url: Option<&str>,
+        commit_hash: &str,
+        mr_url: Option<&str>,
+        mr_title: Option<&str>,
+        mr_number: Option<i64>,
+        priority: i32,
+    ) -> Result<()> {
+        self.enqueue_fetch_with_support(
+            patchset_id,
+            cover_letter_message_id,
+            repo_url,
+            commit_hash,
+            mr_url,
+            mr_title,
+            mr_number,
+            priority,
+            &[],
+        )
+        .await
+    }
+
+    /// Like `enqueue_fetch`, but also records `supporting_commits`: extra commit
+    /// SHAs the worker must ensure are present locally (e.g. the original and
+    /// base commits of a cherry-pick) without ingesting them as patches. Only
+    /// `commit_hash` is ingested; the supporting commits are fetched purely so
+    /// downstream reviews (like the cherry-pick pipeline) can hydrate their full
+    /// context from git.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn enqueue_fetch_with_support(
+        &self,
+        patchset_id: Option<i64>,
+        cover_letter_message_id: Option<&str>,
+        repo_url: Option<&str>,
+        commit_hash: &str,
+        mr_url: Option<&str>,
+        mr_title: Option<&str>,
+        mr_number: Option<i64>,
+        priority: i32,
+        supporting_commits: &[String],
+    ) -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+
+        let tx = self.begin_immediate_transaction().await?;
+        let mut rows = tx
+            .query(
+                "INSERT INTO fetch_queue ( \
+                     patchset_id, cover_letter_message_id, repo_url, commit_hash, \
+                     mr_url, mr_title, mr_number, status, attempts, priority, created_at \
+                 ) \
+                 SELECT ?, ?, ?, ?, ?, ?, ?, 'Pending', 0, ?, ? \
+                 WHERE NOT EXISTS ( \
+                     SELECT 1 FROM fetch_queue \
+                     WHERE commit_hash = ? \
+                       AND IFNULL(repo_url, '') = IFNULL(?, '') \
+                       AND IFNULL(cover_letter_message_id, '') = IFNULL(?, '') \
+                       AND status = 'Pending' \
+                 ) \
+                 RETURNING id",
+                libsql::params![
+                    patchset_id,
+                    cover_letter_message_id,
+                    repo_url,
+                    commit_hash,
+                    mr_url,
+                    mr_title,
+                    mr_number,
+                    priority,
+                    now,
+                    commit_hash,
+                    repo_url,
+                    cover_letter_message_id,
+                ],
+            )
+            .await?;
+        let next_row = rows.next().await?;
+        drop(rows);
+        let fetch_id: i64 = match next_row {
+            Some(row) => row.get(0)?,
+            None => {
+                if supporting_commits.is_empty() {
+                    return Ok(());
+                }
+                // If the fetch was already queued, ensure any newly supplied
+                // supporting commits are recorded under the existing fetch row.
+                let mut existing = tx
+                    .query(
+                        "SELECT id FROM fetch_queue \
+                         WHERE commit_hash = ? \
+                           AND IFNULL(repo_url, '') = IFNULL(?, '') \
+                           AND IFNULL(cover_letter_message_id, '') = IFNULL(?, '') \
+                           AND status = 'Pending' \
+                         ORDER BY id DESC LIMIT 1",
+                        libsql::params![commit_hash, repo_url, cover_letter_message_id],
+                    )
+                    .await?;
+                match existing.next().await? {
+                    Some(row) => row.get(0)?,
+                    None => return Ok(()),
+                }
+            }
+        };
+
+        // Record each supporting commit as its own row (1-to-N) so an arbitrary
+        // number can be stored without packing them into a single column.
+        for sha in supporting_commits {
+            tx.execute(
+                "INSERT INTO fetch_supporting_commits (fetch_id, commit_hash) \
+                 SELECT ?, ? \
+                 WHERE NOT EXISTS ( \
+                     SELECT 1 FROM fetch_supporting_commits \
+                     WHERE fetch_id = ? AND commit_hash = ? \
+                 )",
+                libsql::params![fetch_id, sha.as_str(), fetch_id, sha.as_str()],
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Atomically claim the highest-priority due fetch, leasing it to the caller
+    /// and bumping its attempt count. Fresh rows (lower attempts) are claimed
+    /// ahead of retrying rows so failing fetches cannot starve newly enqueued
+    /// work. Returns None if nothing is due.
+    pub async fn lock_pending_fetch(&self) -> Result<Option<FetchQueueRow>> {
+        self.lock_pending_fetch_with_max_attempts(None).await
+    }
+
+    /// Atomically claim the highest-priority due fetch whose pre-claim attempt
+    /// count does not exceed `max_prev_attempts` (when `Some`), leasing it to
+    /// the caller and bumping its attempt count.
+    pub async fn lock_pending_fetch_with_max_attempts(
+        &self,
+        max_prev_attempts: Option<i64>,
+    ) -> Result<Option<FetchQueueRow>> {
+        self.lock_pending_fetch_filtered(max_prev_attempts, None, &[])
+            .await
+    }
+
+    /// Atomically claim the highest-priority due fetch matching the optional
+    /// attempt and remote-URL filters.
+    ///
+    /// When `only_repo_url` is `Some(r)`, only rows with `IFNULL(repo_url, '') = r`
+    /// are eligible (used to keep multi-row batches homogeneous to one remote).
+    /// When `exclude_repo_urls` is non-empty, rows whose `IFNULL(repo_url, '')`
+    /// appears in `exclude_repo_urls` are skipped so concurrent workers can
+    /// service distinct remotes without blocking on each other's per-remote lock.
+    pub async fn lock_pending_fetch_filtered(
+        &self,
+        max_prev_attempts: Option<i64>,
+        only_repo_url: Option<&str>,
+        exclude_repo_urls: &[String],
+    ) -> Result<Option<FetchQueueRow>> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+
+        let max_attempts_val = match max_prev_attempts {
+            Some(v) => libsql::Value::Integer(v),
+            None => libsql::Value::Null,
+        };
+        let mut params: Vec<libsql::Value> = vec![
+            libsql::Value::Integer(now),
+            libsql::Value::Integer(now),
+            libsql::Value::Integer(now),
+            max_attempts_val.clone(),
+            max_attempts_val,
+        ];
+
+        let mut extra_filters = String::new();
+        if let Some(only_repo) = only_repo_url {
+            extra_filters.push_str(" AND IFNULL(repo_url, '') = ?");
+            params.push(libsql::Value::Text(only_repo.to_string()));
+        }
+        if !exclude_repo_urls.is_empty() {
+            let placeholders = std::iter::repeat_n("?", exclude_repo_urls.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            extra_filters.push_str(&format!(
+                " AND IFNULL(repo_url, '') NOT IN ({placeholders})"
+            ));
+            for repo in exclude_repo_urls {
+                params.push(libsql::Value::Text(repo.clone()));
+            }
+        }
+
+        let sql = format!(
+            "UPDATE fetch_queue \
+             SET status = 'Fetching', locked_at = ?, attempts = attempts + 1, \
+                 first_attempt_at = COALESCE(first_attempt_at, ?) \
+             WHERE id = ( \
+                 SELECT id FROM fetch_queue \
+                 WHERE status = 'Pending' \
+                   AND (next_retry_at IS NULL OR next_retry_at <= ?) \
+                   AND (? IS NULL OR attempts <= ?){extra_filters} \
+                 ORDER BY attempts ASC, priority DESC, created_at ASC LIMIT 1 \
+             ) \
+             RETURNING id, patchset_id, cover_letter_message_id, repo_url, \
+                 commit_hash, mr_url, mr_title, mr_number, status, attempts, \
+                 first_attempt_at, next_retry_at, locked_at, last_error, \
+                 priority, created_at"
+        );
+
+        let mut rows = self.conn.query(&sql, params).await?;
+
+        if let Some(row) = rows.next().await? {
+            let mut row = Self::row_to_fetch_queue(&row)?;
+            drop(rows);
+            row.supporting_commits = self.load_supporting_commits(row.id).await?;
+            Ok(Some(row))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Load the supporting commit SHAs recorded for a claimed fetch, in
+    /// insertion order.
+    async fn load_supporting_commits(&self, fetch_id: i64) -> Result<Vec<String>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT commit_hash FROM fetch_supporting_commits \
+                 WHERE fetch_id = ? ORDER BY id ASC",
+                libsql::params![fetch_id],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(row.get::<String>(0)?);
+        }
+        Ok(out)
+    }
+
+    fn row_to_fetch_queue(row: &libsql::Row) -> Result<FetchQueueRow> {
+        Ok(FetchQueueRow {
+            id: row.get(0)?,
+            patchset_id: row.get::<Option<i64>>(1)?,
+            cover_letter_message_id: row.get::<Option<String>>(2)?,
+            repo_url: row.get::<Option<String>>(3)?,
+            commit_hash: row.get(4)?,
+            commit_range: String::new(),
+            article_id: String::new(),
+            mr_url: row.get::<Option<String>>(5)?,
+            mr_title: row.get::<Option<String>>(6)?,
+            mr_number: row.get::<Option<i64>>(7)?,
+            status: row.get::<String>(8)?.parse()?,
+            attempts: row.get(9)?,
+            retry_count: 0,
+            first_attempt_at: row.get::<Option<i64>>(10)?,
+            next_retry_at: row.get::<Option<i64>>(11)?,
+            locked_at: row.get::<Option<i64>>(12)?,
+            last_error: row.get::<Option<String>>(13)?,
+            error_log: None,
+            priority: row.get(14)?,
+            created_at: row.get(15)?,
+            supporting_commits: Vec::new(),
+        })
+    }
+
     pub async fn has_patchset_by_msgid(&self, msgid: &str) -> Result<bool> {
         let candidates = Self::get_msgid_candidates(msgid);
         for clid in &candidates {
@@ -14200,6 +14566,7 @@ impl Database {
             .await?;
         Ok(id)
     }
+
     pub async fn update_patchset_error(&self, root_msg_id: &str, error: &str) -> Result<()> {
         let candidates = Self::get_msgid_candidates(root_msg_id);
         for clid in candidates {
@@ -15343,18 +15710,26 @@ impl Database {
             if let Some(row) = rows.next().await? {
                 Some(FetchQueueRow {
                     id: row.get(0)?,
+                    patchset_id: None,
+                    cover_letter_message_id: None,
                     repo_url: row.get(1)?,
+                    commit_hash: String::new(),
                     commit_range: row.get(2)?,
-                    article_id: row.get(3)?,
+                    article_id: row.get::<Option<String>>(3)?.unwrap_or_default(),
                     mr_url: row.get(4)?,
                     mr_title: row.get(5)?,
                     mr_number: row.get(6)?,
-                    status: row.get(7)?,
-                    locked_at: row.get(8)?,
+                    status: row.get::<String>(7)?.parse()?,
+                    attempts: 0,
                     retry_count: row.get(9)?,
+                    first_attempt_at: None,
                     next_retry_at: row.get(10)?,
+                    locked_at: row.get(8)?,
+                    last_error: None,
                     error_log: row.get(11)?,
+                    priority: 0,
                     created_at: row.get(12)?,
+                    supporting_commits: Vec::new(),
                 })
             } else {
                 None
@@ -17454,6 +17829,254 @@ mod tests {
             vec!["NETWORKING [GENERAL]".to_string()]
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fetch_queue_claim_is_exclusive_and_ordered() {
+        let db = setup_db().await;
+        db.enqueue_fetch(
+            None,
+            Some("a@x"),
+            Some("repo"),
+            "sha_low",
+            None,
+            None,
+            None,
+            100,
+        )
+        .await
+        .unwrap();
+        db.enqueue_fetch(
+            None,
+            Some("b@x"),
+            Some("repo"),
+            "sha_high",
+            None,
+            None,
+            None,
+            900,
+        )
+        .await
+        .unwrap();
+
+        // Higher priority is claimed first.
+        let first = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(first.commit_hash, "sha_high");
+        assert_eq!(first.status, FetchStatus::Fetching);
+        assert_eq!(first.attempts, 1);
+        assert!(first.first_attempt_at.is_some());
+        assert!(first.locked_at.is_some());
+
+        // A claimed row is not handed out again.
+        let second = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(second.commit_hash, "sha_low");
+
+        assert!(db.lock_pending_fetch().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_queue_enqueue_is_idempotent() {
+        let db = setup_db().await;
+        db.enqueue_fetch(None, None, Some("repo"), "sha", None, None, None, 500)
+            .await
+            .unwrap();
+        db.enqueue_fetch(None, None, Some("repo"), "sha", None, None, None, 500)
+            .await
+            .unwrap();
+        let _ = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert!(db.lock_pending_fetch().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_queue_enqueue_distinct_cover_ids_not_dropped() {
+        let db = setup_db().await;
+        // Two distinct MRs for the same commit range and repo must both be enqueued
+        db.enqueue_fetch(
+            None,
+            Some("mr-1-base..head@sashiko.local"),
+            Some("repo"),
+            "base..head",
+            Some("http://mr1"),
+            Some("MR 1"),
+            Some(1),
+            500,
+        )
+        .await
+        .unwrap();
+        db.enqueue_fetch(
+            None,
+            Some("mr-2-base..head@sashiko.local"),
+            Some("repo"),
+            "base..head",
+            Some("http://mr2"),
+            Some("MR 2"),
+            Some(2),
+            500,
+        )
+        .await
+        .unwrap();
+
+        let first = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(
+            first.cover_letter_message_id.as_deref(),
+            Some("mr-1-base..head@sashiko.local")
+        );
+        let second = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(
+            second.cover_letter_message_id.as_deref(),
+            Some("mr-2-base..head@sashiko.local")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_migrate_fetch_queue_on_version_1_db() {
+        let settings = DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&settings).await.unwrap();
+        // Simulate a legacy DB already at user_version 1 without fetch_queue
+        let schema = include_str!("migrations/001_initial.sql");
+        db.conn.execute_batch(schema).await.unwrap();
+        db.conn
+            .execute("PRAGMA user_version = 1", ())
+            .await
+            .unwrap();
+
+        // migrate() must create fetch_queue even though user_version == 1
+        db.migrate().await.unwrap();
+
+        db.enqueue_fetch(None, None, Some("repo"), "sha", None, None, None, 500)
+            .await
+            .unwrap();
+        let row = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(row.commit_hash, "sha");
+    }
+
+    async fn count_supporting(db: &Database) -> i64 {
+        let mut rows = db
+            .conn
+            .query("SELECT COUNT(*) FROM fetch_supporting_commits", ())
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_fetch_supporting_commits_roundtrip() {
+        let db = setup_db().await;
+        let supporting = vec!["original_sha".to_string(), "base_sha".to_string()];
+        db.enqueue_fetch_with_support(
+            None,
+            Some("cover@x"),
+            Some("repo"),
+            "resolution_sha",
+            None,
+            None,
+            None,
+            500,
+            &supporting,
+        )
+        .await
+        .unwrap();
+
+        let row = db.lock_pending_fetch().await.unwrap().unwrap();
+        // Only the resolution commit is ingested; the original and base commits
+        // ride along as supporting commits, preserved in insertion order.
+        assert_eq!(row.commit_hash, "resolution_sha");
+        assert_eq!(row.supporting_commits, supporting);
+        assert_eq!(count_supporting(&db).await, 2);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_without_support_has_no_supporting_commits() {
+        let db = setup_db().await;
+        db.enqueue_fetch(None, None, Some("repo"), "sha", None, None, None, 500)
+            .await
+            .unwrap();
+        let row = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert!(row.supporting_commits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_fetch_with_support_deduplication_preserves_supporting_commits() {
+        let db = setup_db().await;
+        // First enqueue without supporting commits.
+        db.enqueue_fetch(None, None, Some("repo"), "commit_x", None, None, None, 500)
+            .await
+            .unwrap();
+
+        // Enqueue again with supporting commits while first is still pending.
+        let supporting = vec!["base_1".to_string(), "base_2".to_string()];
+        db.enqueue_fetch_with_support(
+            None,
+            None,
+            Some("repo"),
+            "commit_x",
+            None,
+            None,
+            None,
+            500,
+            &supporting,
+        )
+        .await
+        .unwrap();
+
+        let row = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(row.commit_hash, "commit_x");
+        assert_eq!(row.supporting_commits, supporting);
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_fetch_with_support_active_fetching_creates_new_pending() {
+        let db = setup_db().await;
+        // First enqueue without supporting commits.
+        db.enqueue_fetch(None, None, Some("repo"), "commit_x", None, None, None, 500)
+            .await
+            .unwrap();
+
+        // Worker claims the fetch so status becomes 'Fetching'.
+        let claimed = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(claimed.commit_hash, "commit_x");
+        assert_eq!(claimed.status, FetchStatus::Fetching);
+
+        // Enqueue again with supporting commits while first is in 'Fetching'.
+        let supporting = vec!["base_1".to_string(), "base_2".to_string()];
+        db.enqueue_fetch_with_support(
+            None,
+            None,
+            Some("repo"),
+            "commit_x",
+            None,
+            None,
+            None,
+            500,
+            &supporting,
+        )
+        .await
+        .unwrap();
+
+        // A new Pending row must be created because the active Fetching row
+        // will delete its supporting commits upon completion.
+        let next_row = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_ne!(next_row.id, claimed.id);
+        assert_eq!(next_row.commit_hash, "commit_x");
+        assert_eq!(next_row.supporting_commits, supporting);
+    }
+
+    #[test]
+    fn test_repo_url_from_subject() {
+        assert_eq!(
+            repo_url_from_subject("Fetching abc123 from sso://prodkernel/kernel/icebreaker..."),
+            Some("sso://prodkernel/kernel/icebreaker".to_string())
+        );
+        assert_eq!(
+            repo_url_from_subject("Fetching abc123 from https://example.com/repo.git..."),
+            Some("https://example.com/repo.git".to_string())
+        );
+        assert_eq!(repo_url_from_subject("Fetching abc123 from local..."), None);
+        assert_eq!(repo_url_from_subject("Fetching thread <m@id>..."), None);
+        assert_eq!(repo_url_from_subject("some unrelated subject"), None);
     }
 
     #[tokio::test]
@@ -33450,7 +34073,7 @@ v2: https://lore.kernel.org/linux-mm/grace-b-1@example.org/\n";
             .unwrap()
             .expect("should claim pending fetch request");
         assert_eq!(claimed.article_id, "mr-738-aaa..bbb");
-        assert_eq!(claimed.status, "Fetching");
+        assert_eq!(claimed.status, FetchStatus::Fetching);
 
         let failed_count = db.fail_interrupted_fetching_patchsets().await.unwrap();
         assert_eq!(failed_count, 1);
