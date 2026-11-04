@@ -586,7 +586,11 @@ mod tests {
                     .to_string(),
                 // Only a vanished /proc entry means the child is gone;
                 // any other read error is a broken test, not a kill.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(3) =>
+                {
+                    String::new()
+                }
                 Err(e) => panic!("reading {} failed: {}", stat, e),
             };
             if state.is_empty() || state == "Z" {

@@ -1383,6 +1383,30 @@ pub async fn ensure_remote(
     }
 }
 
+/// Ensures a configured custom remote is present, has its custom
+/// `fetch_refspecs` synchronized in `.git/config`, and is refreshed.
+pub async fn ensure_custom_remote(
+    repo_path: &Path,
+    remote: &crate::settings::CustomRemoteSettings,
+    force_fetch: bool,
+) -> Result<()> {
+    match refresh_remote_with_refspecs(
+        repo_path,
+        &remote.name,
+        &remote.url,
+        remote.fetch_refspecs.as_deref(),
+        force_fetch,
+    )
+    .await?
+    {
+        FetchOutcome::BackedOff => Err(anyhow::anyhow!(
+            "Remote {} failed recently, backing off",
+            remote.name
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Brings a remote's refs up to date and reports what they rest on.
 /// A remote in backoff with a usable local ref is an Ok outcome
 /// here, for a caller that wants to count it apart from a failure.

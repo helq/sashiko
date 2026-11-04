@@ -401,8 +401,7 @@ impl BaselineRegistry {
             for remote in custom_remotes {
                 // Fetch to ensure we have the latest branches (Issue 1)
                 if let Err(e) =
-                    crate::git_ops::ensure_remote(&self.repo_path, &remote.name, &remote.url, false)
-                        .await
+                    crate::git_ops::ensure_custom_remote(&self.repo_path, remote, false).await
                 {
                     warn!(
                         "Failed to ensure custom remote {}: {}. Using local branches.",
