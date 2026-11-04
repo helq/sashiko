@@ -1697,7 +1697,7 @@ pub struct StuckFetchPlaceholder {
 /// Recover a fetch source URL from a placeholder subject of the form
 /// "Fetching <rev> from <url>...". Returns None when the subject carries no URL
 /// source (e.g. a local fetch, or a thread/PR placeholder).
-#[cfg(all(test, feature = "server"))]
+#[cfg(feature = "server")]
 fn repo_url_from_subject(subject: &str) -> Option<String> {
     let after = subject.split_once(" from ")?.1;
     let url = after.strip_suffix("...").unwrap_or(after).trim();
@@ -8524,7 +8524,9 @@ impl Database {
         // 1. Try to find by cover_letter_message_id first (handles placeholders from API/Fetcher)
         let mut clid_candidates = Vec::new();
         if let Some(clid) = cover_letter_message_id {
-            clid_candidates.push((clid.to_string(), false));
+            for c in Self::get_msgid_candidates(clid) {
+                clid_candidates.push((c, false));
+            }
         }
         // Fallback for single-patch git imports where placeholder is
         // sha@sashiko.local but the actual cover letter becomes the sha
@@ -8534,8 +8536,12 @@ impl Database {
         // and the fallback would incorrectly match patchsets from
         // unrelated submissions that happen to share a commit SHA.
         if cover_letter_message_id.is_none() || total_parts == 1 {
-            clid_candidates.push((format!("{}@sashiko.local", message_id), true));
+            for c in Self::get_msgid_candidates(&format!("{}@sashiko.local", message_id)) {
+                clid_candidates.push((c, true));
+            }
         }
+        let mut seen = std::collections::HashSet::new();
+        clid_candidates.retain(|(c, _)| seen.insert(c.clone()));
 
         for (clid, scope_to_thread) in clid_candidates {
             // When using the @sashiko.local fallback, scope the query
@@ -9357,6 +9363,13 @@ impl Database {
                     tx.execute(
                         "UPDATE patchsets SET previous_patchset_id = ? WHERE previous_patchset_id = ? AND id != ?",
                         libsql::params![target_id, merge_from_id, target_id],
+                    )
+                    .await?;
+
+                    // Reassign fetch_queue entries before deleting merge_from_id
+                    tx.execute(
+                        "UPDATE fetch_queue SET patchset_id = ? WHERE patchset_id = ?",
+                        libsql::params![target_id, merge_from_id],
                     )
                     .await?;
 
@@ -14238,6 +14251,138 @@ impl Database {
         Ok(out)
     }
 
+    /// Remove a fetch from the queue once it has been successfully processed.
+    ///
+    /// Completed fetches serve no further purpose: idempotency is guaranteed by
+    /// the local git repository (`is_present`), not by queue history, and no code
+    /// path reads `Done` rows (dedup and stuck-placeholder recovery only consider
+    /// `Pending`/`Fetching`). Deleting the row instead of marking it `Done` keeps
+    /// the queue table bounded to in-flight work.
+    pub async fn mark_fetch_done(&self, id: i64) -> Result<()> {
+        // Foreign-key cascade is not enabled on this connection, so remove the
+        // child supporting-commit rows explicitly before the parent.
+        let tx = self.begin_immediate_transaction().await?;
+        tx.execute(
+            "DELETE FROM fetch_supporting_commits WHERE fetch_id = ?",
+            libsql::params![id],
+        )
+        .await?;
+        tx.execute("DELETE FROM fetch_queue WHERE id = ?", libsql::params![id])
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Release a fetch back to Pending with a future retry time and record the
+    /// last error. Used for transient failures within the retry window.
+    pub async fn set_fetch_retry_at(&self, id: i64, next_retry_at: i64, error: &str) -> Result<()> {
+        self.execute(
+            "UPDATE fetch_queue \
+             SET status = 'Pending', next_retry_at = ?, last_error = ?, \
+                 locked_at = NULL WHERE id = ?",
+            libsql::params![next_retry_at, error, id],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Terminally fail a fetch after its retry window is exhausted.
+    pub async fn mark_fetch_failed(&self, id: i64, error: &str) -> Result<()> {
+        self.execute(
+            "UPDATE fetch_queue SET status = 'Failed', last_error = ?, \
+             locked_at = NULL WHERE id = ?",
+            libsql::params![error, id],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Reclaim fetches whose lease has expired because their worker died
+    /// mid-flight. Returns the number of rows reset to Pending.
+    pub async fn sweep_ghost_fetches(&self, lease_secs: i64) -> Result<u64> {
+        let cutoff = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64)
+            - lease_secs;
+        let count = self
+            .conn
+            .execute(
+                "UPDATE fetch_queue SET status = 'Pending', locked_at = NULL \
+                 WHERE id IN ( \
+                     SELECT id FROM fetch_queue \
+                     WHERE status = 'Fetching' AND locked_at IS NOT NULL \
+                       AND locked_at < ? LIMIT 100 \
+                 )",
+                libsql::params![cutoff],
+            )
+            .await?;
+        Ok(count)
+    }
+
+    /// Renew the lease on an in-flight fetch so long-running operations do not
+    /// get reclaimed by the ghost sweep. Returns true if the lease was
+    /// successfully renewed, or false if the lease was lost or already finished.
+    pub async fn renew_fetch_lease(&self, id: i64, expected_attempts: i64) -> Result<bool> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+        let count = self
+            .conn
+            .execute(
+                "UPDATE fetch_queue SET locked_at = ? \
+                 WHERE id = ? AND status = 'Fetching' AND attempts = ?",
+                libsql::params![now, id, expected_attempts],
+            )
+            .await?;
+        Ok(count > 0)
+    }
+
+    /// Return patchsets stuck in 'Fetching' that have no active fetch_queue row.
+    /// Used at startup to recover placeholders created before the durable queue
+    /// existed, or orphaned by a crash.
+    pub async fn get_stuck_fetch_placeholders(&self) -> Result<Vec<StuckFetchPlaceholder>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT p.id, p.cover_letter_message_id, \
+                        COALESCE(p.repo_url, b.repo_url), p.mr_url, \
+                        p.mr_title, p.mr_number, IFNULL(p.priority, 500), \
+                        p.subject \
+                 FROM patchsets p \
+                 LEFT JOIN baselines b ON p.baseline_id = b.id \
+                 WHERE p.status = 'Fetching' \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM fetch_queue fq \
+                       WHERE fq.patchset_id = p.id \
+                         AND fq.status IN ('Pending', 'Fetching') \
+                   ) \
+                 LIMIT 100",
+                (),
+            )
+            .await?;
+
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            // Prefer persisted patchsets.repo_url / baseline url; for old
+            // placeholders that predate the column and have no baseline, recover
+            // the source URL from the subject ("Fetching <rev> from <url>...").
+            let subject = row.get::<Option<String>>(7)?.unwrap_or_default();
+            let repo_url = row
+                .get::<Option<String>>(2)?
+                .or_else(|| repo_url_from_subject(&subject));
+            out.push(StuckFetchPlaceholder {
+                patchset_id: row.get(0)?,
+                cover_letter_message_id: row.get::<Option<String>>(1)?,
+                repo_url,
+                mr_url: row.get::<Option<String>>(3)?,
+                mr_title: row.get::<Option<String>>(4)?,
+                mr_number: row.get::<Option<i64>>(5)?,
+                priority: row.get(6)?,
+            });
+        }
+        Ok(out)
+    }
+
     fn row_to_fetch_queue(row: &libsql::Row) -> Result<FetchQueueRow> {
         Ok(FetchQueueRow {
             id: row.get(0)?,
@@ -17953,6 +18098,83 @@ mod tests {
         assert_eq!(row.commit_hash, "sha");
     }
 
+    #[tokio::test]
+    async fn test_fetch_queue_retry_gating() {
+        let db = setup_db().await;
+        db.enqueue_fetch(None, None, Some("repo"), "sha", None, None, None, 500)
+            .await
+            .unwrap();
+        let row = db.lock_pending_fetch().await.unwrap().unwrap();
+
+        // A retry scheduled in the far future must not be claimable now.
+        db.set_fetch_retry_at(row.id, 4_000_000_000, "transient")
+            .await
+            .unwrap();
+        assert!(db.lock_pending_fetch().await.unwrap().is_none());
+
+        // A retry scheduled in the past becomes claimable again.
+        db.set_fetch_retry_at(row.id, 1, "transient").await.unwrap();
+        let again = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(again.attempts, 2);
+        assert_eq!(again.commit_hash, "sha");
+        assert_eq!(again.last_error.as_deref(), Some("transient"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_queue_demotes_retries_behind_fresh_work() {
+        let db = setup_db().await;
+        // Enqueue an older item with high priority and simulate a failed attempt
+        // whose retry window has already elapsed.
+        db.enqueue_fetch(
+            None,
+            None,
+            Some("repo"),
+            "retrying_sha",
+            None,
+            None,
+            None,
+            600,
+        )
+        .await
+        .unwrap();
+        let first_attempt = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(first_attempt.commit_hash, "retrying_sha");
+        assert_eq!(first_attempt.attempts, 1);
+        db.set_fetch_retry_at(first_attempt.id, 1, "transient")
+            .await
+            .unwrap();
+
+        // Enqueue a newer fresh item (attempts = 0) with default priority.
+        db.enqueue_fetch(None, None, Some("repo"), "fresh_sha", None, None, None, 500)
+            .await
+            .unwrap();
+
+        // Fresh work (attempts = 0) must be claimed ahead of due retries (attempts = 1).
+        let claimed_first = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(claimed_first.commit_hash, "fresh_sha");
+        assert_eq!(claimed_first.attempts, 1);
+
+        let claimed_second = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(claimed_second.commit_hash, "retrying_sha");
+        assert_eq!(claimed_second.attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_queue_done_and_failed_are_terminal() {
+        let db = setup_db().await;
+        db.enqueue_fetch(None, None, Some("r"), "done_sha", None, None, None, 500)
+            .await
+            .unwrap();
+        db.enqueue_fetch(None, None, Some("r"), "fail_sha", None, None, None, 500)
+            .await
+            .unwrap();
+        let a = db.lock_pending_fetch().await.unwrap().unwrap();
+        db.mark_fetch_done(a.id).await.unwrap();
+        let b = db.lock_pending_fetch().await.unwrap().unwrap();
+        db.mark_fetch_failed(b.id, "boom").await.unwrap();
+        assert!(db.lock_pending_fetch().await.unwrap().is_none());
+    }
+
     async fn count_supporting(db: &Database) -> i64 {
         let mut rows = db
             .conn
@@ -17996,6 +18218,31 @@ mod tests {
             .unwrap();
         let row = db.lock_pending_fetch().await.unwrap().unwrap();
         assert!(row.supporting_commits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_mark_fetch_done_removes_supporting_commits() {
+        let db = setup_db().await;
+        db.enqueue_fetch_with_support(
+            None,
+            None,
+            Some("repo"),
+            "resolution_sha",
+            None,
+            None,
+            None,
+            500,
+            &["original_sha".to_string(), "base_sha".to_string()],
+        )
+        .await
+        .unwrap();
+        let row = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(count_supporting(&db).await, 2);
+
+        db.mark_fetch_done(row.id).await.unwrap();
+        // Completing a fetch removes its supporting-commit child rows so the
+        // table stays bounded to in-flight work.
+        assert_eq!(count_supporting(&db).await, 0);
     }
 
     #[tokio::test]
@@ -18062,6 +18309,95 @@ mod tests {
         assert_ne!(next_row.id, claimed.id);
         assert_eq!(next_row.commit_hash, "commit_x");
         assert_eq!(next_row.supporting_commits, supporting);
+    }
+
+    #[tokio::test]
+    async fn test_sweep_ghost_fetches_reclaims_expired_lease() {
+        let db = setup_db().await;
+        db.enqueue_fetch(None, None, Some("r"), "sha", None, None, None, 500)
+            .await
+            .unwrap();
+        let row = db.lock_pending_fetch().await.unwrap().unwrap();
+
+        // A generous lease keeps the in-flight row locked (nothing reclaimed).
+        assert_eq!(db.sweep_ghost_fetches(1_000_000_000).await.unwrap(), 0);
+        assert!(db.lock_pending_fetch().await.unwrap().is_none());
+
+        // A negative lease treats every lease as already expired, so the
+        // ghosted row is reclaimed and becomes claimable again.
+        assert_eq!(db.sweep_ghost_fetches(-100_000).await.unwrap(), 1);
+        let again = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(again.id, row.id);
+    }
+
+    #[tokio::test]
+    async fn test_renew_fetch_lease() {
+        let db = setup_db().await;
+        db.enqueue_fetch(None, None, Some("r"), "sha", None, None, None, 500)
+            .await
+            .unwrap();
+        let row = db.lock_pending_fetch().await.unwrap().unwrap();
+        let initial_attempts = row.attempts;
+        let initial_locked_at = row.locked_at.unwrap();
+
+        // Successful lease renewal using current attempts.
+        let updated = db
+            .renew_fetch_lease(row.id, initial_attempts)
+            .await
+            .unwrap();
+        assert!(updated);
+
+        // Attempting renewal with non-matching attempts fails.
+        let wrong_attempts = db
+            .renew_fetch_lease(row.id, initial_attempts + 1)
+            .await
+            .unwrap();
+        assert!(!wrong_attempts);
+
+        let non_existent = db
+            .renew_fetch_lease(999_999, initial_attempts)
+            .await
+            .unwrap();
+        assert!(!non_existent);
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT locked_at FROM fetch_queue WHERE id = ?",
+                libsql::params![row.id],
+            )
+            .await
+            .unwrap();
+        let renewed_locked_at: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert!(renewed_locked_at >= initial_locked_at);
+
+        // Sweep ghost fetches to return row to Pending. While in Pending, renewal fails.
+        assert_eq!(db.sweep_ghost_fetches(-100_000).await.unwrap(), 1);
+        let pending_renew = db
+            .renew_fetch_lease(row.id, initial_attempts)
+            .await
+            .unwrap();
+        assert!(!pending_renew);
+
+        // Another worker reclaims the row, incrementing attempts (e.g. 1 -> 2).
+        let reclaimed = db.lock_pending_fetch().await.unwrap().unwrap();
+        assert_eq!(reclaimed.id, row.id);
+        assert_eq!(reclaimed.attempts, initial_attempts + 1);
+
+        // The stalled worker attempting renewal with stale attempts fails,
+        // preventing ABA lease hijacking when reclaimed by another worker.
+        let stale = db
+            .renew_fetch_lease(row.id, initial_attempts)
+            .await
+            .unwrap();
+        assert!(!stale);
+
+        // The new worker with current attempts can successfully renew.
+        let active = db
+            .renew_fetch_lease(row.id, reclaimed.attempts)
+            .await
+            .unwrap();
+        assert!(active);
     }
 
     #[test]
