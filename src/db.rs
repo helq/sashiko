@@ -35812,4 +35812,99 @@ v2: https://lore.kernel.org/linux-mm/grace-b-1@example.org/\n";
         let prio2: i64 = row2.next().await.unwrap().unwrap().get(0).unwrap();
         assert_eq!(prio2, 400);
     }
+
+    #[tokio::test]
+    async fn test_create_patchset_matches_placeholder_without_suffix() {
+        let db = setup_db().await;
+        // Create a placeholder with unsuffixed ID (as might exist from older webhooks)
+        let placeholder_id = "mr-99-base..head";
+        let pid = db
+            .create_fetching_patchset(
+                placeholder_id,
+                "Fetching MR 99",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Ingestion passes suffixed root_msg_id as cover_letter_id
+        let suffixed_id = "mr-99-base..head@sashiko.local";
+        let thread_id = db
+            .ensure_thread_for_message(suffixed_id, 1000)
+            .await
+            .unwrap();
+        let matched_id = db
+            .create_patchset(
+                thread_id,
+                Some(suffixed_id),
+                "commit_sha_1",
+                "MR 99 Subject",
+                "Author",
+                1000,
+                2,
+                1,
+                "to",
+                "cc",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(matched_id, Some(pid));
+    }
+
+    #[tokio::test]
+    async fn test_get_stuck_fetch_placeholders_finds_orphans() {
+        let db = setup_db().await;
+        // A patchset stuck in 'Fetching' with no queue row is an orphan.
+        db.create_fetching_patchset(
+            "orphan@sashiko.local",
+            "Fetching x",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let stuck = db.get_stuck_fetch_placeholders().await.unwrap();
+        assert_eq!(stuck.len(), 1);
+        assert_eq!(
+            stuck[0].cover_letter_message_id.as_deref(),
+            Some("orphan@sashiko.local")
+        );
+
+        // Once an active queue row exists, it is no longer reported.
+        let pid = stuck[0].patchset_id;
+        db.enqueue_fetch(
+            Some(pid),
+            Some("orphan@sashiko.local"),
+            None,
+            "orphan",
+            None,
+            None,
+            None,
+            500,
+        )
+        .await
+        .unwrap();
+        assert!(db.get_stuck_fetch_placeholders().await.unwrap().is_empty());
+    }
 }
