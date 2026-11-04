@@ -14448,6 +14448,8 @@ impl Database {
         mr_title: Option<&str>,
         mr_number: Option<i64>,
         slug: Option<&str>,
+        repo_url: Option<&str>,
+        priority: Option<i32>,
     ) -> Result<i64> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -14669,10 +14671,17 @@ impl Database {
                     if let Some(s) = slug {
                         tx_db.rotate_mr_slug(s, Some(id)).await?;
                     }
-                    tx_db.execute(
-                        "UPDATE patchsets SET status = 'Fetching', failed_reason = NULL, subject = ?, skip_filters = ?, only_filters = ?, mr_url = ?, mr_title = ?, mr_number = ?, slug = ?, version = COALESCE(?, version) WHERE id = ?",
-                        libsql::params![effective_subject, skip_filters_json.clone(), only_filters_json.clone(), mr_url, mr_title, mr_number, slug, effective_ver, id]
-                    ).await?;
+                    if let Some(prio) = priority {
+                        tx_db.execute(
+                            "UPDATE patchsets SET status = 'Fetching', failed_reason = NULL, subject = ?, skip_filters = ?, only_filters = ?, mr_url = ?, mr_title = ?, mr_number = ?, slug = ?, version = COALESCE(?, version), repo_url = ?, priority = COALESCE(MAX(priority, ?), ?) WHERE id = ?",
+                            libsql::params![effective_subject, skip_filters_json.clone(), only_filters_json.clone(), mr_url, mr_title, mr_number, slug, effective_ver, repo_url, prio, prio, id]
+                        ).await?;
+                    } else {
+                        tx_db.execute(
+                            "UPDATE patchsets SET status = 'Fetching', failed_reason = NULL, subject = ?, skip_filters = ?, only_filters = ?, mr_url = ?, mr_title = ?, mr_number = ?, slug = ?, version = COALESCE(?, version), repo_url = ? WHERE id = ?",
+                            libsql::params![effective_subject, skip_filters_json.clone(), only_filters_json.clone(), mr_url, mr_title, mr_number, slug, effective_ver, repo_url, id]
+                        ).await?;
+                    }
                     tx_db.reset_patchset_review_state(id).await?;
                     tx_db
                         .execute(
@@ -14698,11 +14707,12 @@ impl Database {
         }
 
         // 2. Create the fetching patchset atomically inside the transaction
+        let eff_priority = priority.unwrap_or(crate::settings::DEFAULT_PRIORITY);
         let id = tx_db
             .query_returning_i64(
-                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, status, date, skip_filters, only_filters, mr_url, mr_title, mr_number, slug, version)
-                     VALUES (?, ?, ?, 'Fetching', ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-                libsql::params![thread_id, root_msg_id, effective_subject, now, skip_filters_json, only_filters_json, mr_url, mr_title, mr_number, slug, effective_ver],
+                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, status, date, skip_filters, only_filters, mr_url, mr_title, mr_number, slug, version, repo_url, priority)
+                     VALUES (?, ?, ?, 'Fetching', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                libsql::params![thread_id, root_msg_id, effective_subject, now, skip_filters_json, only_filters_json, mr_url, mr_title, mr_number, slug, effective_ver, repo_url, eff_priority],
             )
             .await?
             .ok_or_else(|| anyhow::anyhow!("Failed to get patchset ID"))?;
@@ -16140,12 +16150,16 @@ impl Database {
                         EXISTS (
                             SELECT 1 FROM fetch_queue fq
                             WHERE fq.status IN ('Pending', 'Fetching', 'Done')
-                              AND fq.article_id IN (
-                                  TRIM(COALESCE(ps.cover_letter_message_id, ''), '<>'),
-                                  REPLACE(
+                              AND (
+                                  fq.patchset_id = ps.id
+                                  OR fq.cover_letter_message_id = ps.cover_letter_message_id
+                                  OR fq.article_id IN (
                                       TRIM(COALESCE(ps.cover_letter_message_id, ''), '<>'),
-                                      '@sashiko.local',
-                                      ''
+                                      REPLACE(
+                                          TRIM(COALESCE(ps.cover_letter_message_id, ''), '<>'),
+                                          '@sashiko.local',
+                                          ''
+                                      )
                                   )
                               )
                         ) AS has_active_fetch
@@ -22861,6 +22875,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -23861,6 +23877,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -23959,6 +23977,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -23979,6 +23999,8 @@ mod tests {
             .create_fetching_patchset(
                 &synthetic_cancelled,
                 "Fetching cancelled placeholder",
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -24233,6 +24255,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -24300,6 +24324,8 @@ mod tests {
             .create_fetching_patchset(
                 &synthetic_cover,
                 "Fetching retry",
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -27113,6 +27139,8 @@ mod tests {
                 Some(pr_title),
                 Some(501),
                 Some(slug),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -27247,6 +27275,8 @@ mod tests {
                 Some(title),
                 Some(mr_number),
                 Some(slug),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -27278,6 +27308,8 @@ mod tests {
                 Some(title),
                 Some(mr_number),
                 Some(slug),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -27301,6 +27333,8 @@ mod tests {
                 Some(title),
                 Some(mr_number),
                 Some(slug),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -27349,6 +27383,8 @@ mod tests {
                 Some("Sashiko fixups"),
                 Some(515),
                 Some("sashiko-515"),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -27433,6 +27469,8 @@ mod tests {
                 Some("Fix workflow retry"),
                 Some(733),
                 Some("sashiko-733"),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -27527,6 +27565,8 @@ mod tests {
                 Some("Embargoed partial failure"),
                 Some(734),
                 Some("sashiko-734"),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -27591,6 +27631,8 @@ mod tests {
                 Some("Improve review cancellation"),
                 Some(515),
                 Some("sashiko-515"),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -27606,6 +27648,8 @@ mod tests {
                 Some("Improve review cancellation"),
                 Some(515),
                 Some("sashiko-515"),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -27621,6 +27665,8 @@ mod tests {
                 Some("Improve review cancellation"),
                 Some(515),
                 Some("sashiko-515"),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -27657,6 +27703,8 @@ mod tests {
                 Some("Improve review cancellation"),
                 Some(515),
                 Some("sashiko-515"),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -27680,6 +27728,8 @@ mod tests {
                 Some("Improve review cancellation"),
                 Some(515),
                 Some("sashiko-515"),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -28004,6 +28054,8 @@ mod tests {
                 Some("Test claim guard"),
                 Some(600),
                 Some("sashiko-600"),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -29519,6 +29571,8 @@ mod tests {
                         None,
                         None,
                         None,
+                        None,
+                        None,
                     )
                     .await
                     .expect("create_fetching_patchset failed under concurrency");
@@ -29611,12 +29665,16 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
         .unwrap();
         db.create_fetching_patchset(
             "msg-fetching-2",
             "(placeholder)",
+            None,
+            None,
             None,
             None,
             None,
@@ -29705,11 +29763,45 @@ mod tests {
             .await
             .unwrap();
 
+        let ps_queued = db
+            .create_fetching_patchset(
+                "msg-fetching-queued@sashiko.local",
+                "(placeholder)",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("sso://prodkernel/kernel/icebreaker"),
+                None,
+            )
+            .await
+            .unwrap();
+        db.enqueue_fetch(
+            Some(ps_queued),
+            Some("msg-fetching-queued@sashiko.local"),
+            Some("sso://prodkernel/kernel/icebreaker"),
+            "msg-fetching-queued",
+            None,
+            None,
+            None,
+            500,
+        )
+        .await
+        .unwrap();
+
         let cleaned = db.fail_interrupted_fetching_patchsets().await.unwrap();
         assert_eq!(cleaned, 1);
         assert!(
             !db.has_patchset_by_msgid("msg-fetching-2").await.unwrap(),
-            "Interrupted fetching patchset should allow retry after startup cleanup"
+            "Interrupted fetching patchset without fetch_queue row should allow retry after startup cleanup"
+        );
+        assert!(
+            db.has_patchset_by_msgid("msg-fetching-queued@sashiko.local")
+                .await
+                .unwrap(),
+            "Fetching patchset backed by active fetch_queue row must remain Fetching across startup cleanup"
         );
 
         for id in [cover_ps_id, corrupted_ps_id] {
@@ -34373,6 +34465,8 @@ v2: https://lore.kernel.org/linux-mm/grace-b-1@example.org/\n";
                 Some("Durable fetch queue"),
                 Some(738),
                 Some("sashiko-738"),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -34380,6 +34474,8 @@ v2: https://lore.kernel.org/linux-mm/grace-b-1@example.org/\n";
             .create_fetching_patchset(
                 "lore-thread@example.com",
                 "Fetching thread...",
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -34518,6 +34614,8 @@ v2: https://lore.kernel.org/linux-mm/grace-b-1@example.org/\n";
                 Some("Cancelled PR"),
                 Some(739),
                 Some("sashiko-739"),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -34584,6 +34682,8 @@ v2: https://lore.kernel.org/linux-mm/grace-b-1@example.org/\n";
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -34600,6 +34700,8 @@ v2: https://lore.kernel.org/linux-mm/grace-b-1@example.org/\n";
                 Some("Active PR"),
                 Some(740),
                 Some("sashiko-740"),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -34654,6 +34756,8 @@ v2: https://lore.kernel.org/linux-mm/grace-b-1@example.org/\n";
                 Some("Partial series"),
                 Some(741),
                 Some("sashiko-741"),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -34781,6 +34885,8 @@ v2: https://lore.kernel.org/linux-mm/grace-b-1@example.org/\n";
                 Some("Partial series"),
                 Some(741),
                 Some("sashiko-741"),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -34823,6 +34929,8 @@ v2: https://lore.kernel.org/linux-mm/grace-b-1@example.org/\n";
                 Some("Resubmitted PR"),
                 Some(742),
                 Some("sashiko-742"),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -34854,6 +34962,8 @@ v2: https://lore.kernel.org/linux-mm/grace-b-1@example.org/\n";
             Some("Resubmitted PR"),
             Some(742),
             Some("sashiko-742"),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -34942,6 +35052,8 @@ v2: https://lore.kernel.org/linux-mm/grace-b-1@example.org/\n";
                 Some("Test PR"),
                 Some(500),
                 Some("sashiko-500"),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -35072,6 +35184,8 @@ v2: https://lore.kernel.org/linux-mm/grace-b-1@example.org/\n";
                 Some("Test PR"),
                 Some(500),
                 Some("sashiko-500"),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -35090,6 +35204,8 @@ v2: https://lore.kernel.org/linux-mm/grace-b-1@example.org/\n";
                 Some("Test PR"),
                 Some(500),
                 Some("sashiko-500"),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -35178,6 +35294,8 @@ v2: https://lore.kernel.org/linux-mm/grace-b-1@example.org/\n";
                 Some("Fork PR"),
                 Some(500),
                 Some("other-sashiko-500"),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -35204,6 +35322,8 @@ v2: https://lore.kernel.org/linux-mm/grace-b-1@example.org/\n";
                 Some("Test PR"),
                 Some(500),
                 Some("sashiko-500"),
+                None,
+                None,
             )
             .await
             .unwrap();

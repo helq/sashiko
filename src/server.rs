@@ -17,7 +17,6 @@ use crate::api::*;
 use crate::baseline::CommitId;
 use crate::db::Database;
 use crate::events::{Event, MessageSource};
-use crate::fetcher::FetchRequest;
 use crate::mbox::LoreMboxClient;
 use axum::{
     Json, Router,
@@ -245,7 +244,6 @@ pub struct AppState {
     pub settings: Arc<crate::settings::Settings>,
     pub db: Arc<Database>,
     pub sender: mpsc::Sender<Event>,
-    pub fetch_sender: mpsc::Sender<FetchRequest>,
     pub forge_registry: Arc<crate::forge::ForgeRegistry>,
     pub read_only: bool,
     pub allow_all_submit: bool,
@@ -288,7 +286,6 @@ pub fn build_router(
     settings: Arc<crate::settings::Settings>,
     db: Arc<Database>,
     sender: mpsc::Sender<Event>,
-    fetch_sender: mpsc::Sender<FetchRequest>,
     options: ServerOptions,
 ) -> Router {
     let forge_registry = Arc::new(crate::forge::ForgeRegistry::new());
@@ -298,7 +295,6 @@ pub fn build_router(
         settings: settings.clone(),
         db,
         sender,
-        fetch_sender,
         read_only,
         forge_registry,
         allow_all_submit: options.allow_all_submit,
@@ -383,10 +379,9 @@ pub async fn run_server(
     settings: Arc<crate::settings::Settings>,
     db: Arc<Database>,
     sender: mpsc::Sender<Event>,
-    fetch_sender: mpsc::Sender<FetchRequest>,
     options: ServerOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let app = build_router(settings.clone(), db, sender, fetch_sender, options);
+    let app = build_router(settings.clone(), db, sender, options);
 
     let bind_addr = format!("{}:{}", settings.server.host, settings.server.port);
     let addrs: Vec<SocketAddr> = bind_addr
@@ -568,6 +563,11 @@ async fn submit_patch(
                 return Err(StatusCode::BAD_REQUEST.into_response());
             }
 
+            if !already_local && crate::fetcher::url_has_embedded_credentials(repo.as_deref()) {
+                warn!("Rejected remote fetch request with credentialed repository URL");
+                return Err(StatusCode::BAD_REQUEST.into_response());
+            }
+
             let effective_repo = if already_local {
                 if repo.is_some() {
                     info!(
@@ -586,80 +586,83 @@ async fn submit_patch(
                 repo_display
             };
 
-            let placeholder_id = format!("{}@sashiko.local", id);
+            let fetch_priority = state
+                .settings
+                .git
+                .fetch_priority_for_url(effective_repo.as_deref());
+
             // Create a placeholder record in the DB so the user can track status
-            let ps_id = match state
+            let cover_id = format!("{}@sashiko.local", id);
+            let patchset_id = match state
                 .db
                 .create_fetching_patchset(
-                    &placeholder_id,
-                    &format!("Fetching {} from {}...", sha, repo_display),
+                    &cover_id,
+                    &format!("Fetching {} from {}...", &sha, repo_display),
                     skip_subjects.as_ref(),
                     only_subjects.as_ref(),
                     None,
                     None,
                     None,
                     None,
+                    effective_repo.as_deref(),
+                    Some(fetch_priority),
                 )
                 .await
             {
-                Ok(ps_id) => ps_id,
+                Ok(pid) => pid,
                 Err(e) => {
                     error!("Failed to create placeholder patchset: {}", e);
                     return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
                 }
             };
 
-            let should_enqueue = match state.db.get_patchset_status(ps_id).await {
+            let should_enqueue = match state.db.get_patchset_status(patchset_id).await {
                 Ok(Some(status)) => status == "Fetching",
                 Ok(None) => false,
                 Err(e) => {
                     error!("Failed to inspect placeholder patchset status: {}", e);
-                    fail_fetching_patchset_logged(
-                        &state.db,
-                        &placeholder_id,
-                        "Failed to verify placeholder patchset status",
-                    )
-                    .await;
+                    if let Err(err) = state
+                        .db
+                        .update_patchset_error(
+                            &cover_id,
+                            &format!("Failed to verify placeholder status: {}", e),
+                        )
+                        .await
+                    {
+                        error!("Failed to mark patchset {} failed: {}", cover_id, err);
+                    }
                     return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
                 }
             };
 
             if should_enqueue {
-                let req = FetchRequest {
-                    repo_url: effective_repo.clone(),
-                    commit_hash: sha.clone(),
-                    mr_url: None,
-                    mr_title: None,
-                    mr_number: None,
-                };
-
-                if crate::fetcher::url_has_embedded_credentials(effective_repo.as_deref()) {
-                    if let Err(e) = state.fetch_sender.try_send(req) {
-                        error!("Failed to send fetch request to queue: {}", e);
-                        fail_fetching_patchset_logged(
-                            &state.db,
-                            &placeholder_id,
-                            "Failed to queue in-memory fetch request",
-                        )
-                        .await;
-                        return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
-                    }
-                } else {
-                    if let Err(e) = state
+                // Persist the fetch durably; the FetchWorker will pick it up.
+                if let Err(e) = state
+                    .db
+                    .enqueue_fetch(
+                        Some(patchset_id),
+                        Some(&cover_id),
+                        effective_repo.as_deref(),
+                        &sha,
+                        None,
+                        None,
+                        None,
+                        fetch_priority,
+                    )
+                    .await
+                {
+                    error!("Failed to enqueue fetch request: {}", e);
+                    if let Err(err) = state
                         .db
-                        .enqueue_fetch_request(effective_repo.as_deref(), &sha, None, None, None)
+                        .update_patchset_error(
+                            &cover_id,
+                            &format!("Failed to enqueue fetch: {}", e),
+                        )
                         .await
                     {
-                        error!("Failed to persist fetch request in fetch_queue: {}", e);
-                        fail_fetching_patchset_logged(
-                            &state.db,
-                            &placeholder_id,
-                            "Failed to enqueue fetch request",
-                        )
-                        .await;
-                        return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                        error!("Failed to mark patchset {} failed: {}", cover_id, err);
                     }
-                    let _ = state.fetch_sender.try_send(req);
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
                 }
             }
 
@@ -684,6 +687,8 @@ async fn submit_patch(
                 .create_fetching_patchset(
                     &clean_msgid,
                     &format!("Fetching thread {}...", clean_msgid),
+                    None,
+                    None,
                     None,
                     None,
                     None,
@@ -2427,7 +2432,12 @@ async fn forge_webhook(
         return Err(StatusCode::BAD_REQUEST.into_response());
     }
 
-    ingest_forge_pull_request(&state.db, &state.fetch_sender, forge.name(), metadata)
+    let fetch_priority = state
+        .settings
+        .git
+        .fetch_priority_for_url(metadata.repo_url.as_deref());
+
+    ingest_forge_pull_request(&state.db, forge.name(), metadata, fetch_priority)
         .await
         .map_err(|e| {
             error!("{}", e);
@@ -2446,9 +2456,9 @@ async fn forge_webhook(
 /// review state).
 pub async fn ingest_forge_pull_request(
     db: &Database,
-    fetch_sender: &mpsc::Sender<FetchRequest>,
     forge_name: &str,
     metadata: crate::forge::ForgeMetadata,
+    fetch_priority: i32,
 ) -> Result<bool, String> {
     if let Some(ref author) = metadata.author
         && crate::forge::is_dependabot_author(author)
@@ -2480,7 +2490,7 @@ pub async fn ingest_forge_pull_request(
         format!("{}-{}", repo, metadata.pr_number)
     });
 
-    let ps_id = db
+    let patchset_id = db
         .create_fetching_patchset(
             &placeholder_id,
             &format!("Fetching {} PR/MR: {}", forge_name, subject),
@@ -2490,11 +2500,13 @@ pub async fn ingest_forge_pull_request(
             Some(subject),
             Some(metadata.pr_number),
             slug.as_deref(),
+            metadata.repo_url.as_deref(),
+            Some(fetch_priority),
         )
         .await
         .map_err(|e| format!("Failed to create placeholder patchset: {}", e))?;
 
-    let should_enqueue = match db.get_patchset_status(ps_id).await {
+    let should_enqueue = match db.get_patchset_status(patchset_id).await {
         Ok(Some(status)) => status == "Fetching",
         Ok(None) => false,
         Err(e) => {
@@ -2516,30 +2528,21 @@ pub async fn ingest_forge_pull_request(
     }
 
     if let Err(e) = db
-        .enqueue_fetch_request(
+        .enqueue_fetch(
+            Some(patchset_id),
+            Some(&placeholder_id),
             metadata.repo_url.as_deref(),
             &commit_range,
             metadata.pr_url.as_deref(),
             metadata.pr_title.as_deref(),
             Some(metadata.pr_number),
+            fetch_priority,
         )
         .await
     {
         fail_fetching_patchset_logged(db, &placeholder_id, "Failed to enqueue fetch request").await;
-        return Err(format!(
-            "Failed to persist fetch request in fetch_queue: {}",
-            e
-        ));
+        return Err(format!("Failed to enqueue fetch request: {}", e));
     }
-
-    let req = FetchRequest {
-        repo_url: metadata.repo_url,
-        commit_hash: commit_range,
-        mr_url: metadata.pr_url,
-        mr_title: metadata.pr_title,
-        mr_number: Some(metadata.pr_number),
-    };
-    let _ = fetch_sender.try_send(req);
 
     Ok(true)
 }
@@ -3156,12 +3159,10 @@ mod tests {
         let local_token = crate::auth::LocalToken::generate().unwrap();
         let local_token_secret = local_token.secret().to_string();
         let (event_tx, _event_rx) = mpsc::channel(10);
-        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
         let app = build_router(
             settings,
             db,
             event_tx,
-            fetch_tx,
             ServerOptions {
                 local_token: Some(local_token),
                 ..Default::default()
@@ -3391,12 +3392,11 @@ mod tests {
 
         let local_token = crate::auth::LocalToken::generate().unwrap();
         let (event_tx, _event_rx) = mpsc::channel(10);
-        let (fetch_tx, mut fetch_rx) = mpsc::channel(10);
+
         let app = build_router(
             settings,
             db.clone(),
             event_tx,
-            fetch_tx,
             ServerOptions {
                 local_token: Some(local_token.clone()),
                 ..Default::default()
@@ -3490,13 +3490,18 @@ mod tests {
             .unwrap()
             .status();
         assert!(accepted.is_success(), "token was refused: {}", accepted);
-        let req_missing_with_remote = fetch_rx
-            .try_recv()
+        let req_missing_with_remote = db
+            .lock_pending_fetch()
+            .await
+            .unwrap()
             .expect("fetch request must be queued for missing commit with remote repo");
         assert_eq!(
             req_missing_with_remote.repo_url.as_deref(),
             Some("https://example.org/linux.git")
         );
+        db.mark_fetch_done(req_missing_with_remote.id)
+            .await
+            .unwrap();
 
         // Missing commit with no repo URL is rejected immediately with 400.
         let missing_no_repo = client
@@ -3532,14 +3537,17 @@ mod tests {
             "existing local commit without repo was refused: {}",
             local_no_repo
         );
-        let req_local_no_repo = fetch_rx
-            .try_recv()
+        let req_local_no_repo = db
+            .lock_pending_fetch()
+            .await
+            .unwrap()
             .expect("fetch request must be queued for local commit");
         assert_eq!(req_local_no_repo.commit_hash, existing_sha_1);
         assert_eq!(
             req_local_no_repo.repo_url, None,
             "effective_repo must be None for local commit"
         );
+        db.mark_fetch_done(req_local_no_repo.id).await.unwrap();
 
         // Existing local commit with redundant remote repo URL is accepted and clears effective_repo to None.
         let local_with_redundant_repo = client
@@ -3559,14 +3567,19 @@ mod tests {
             "existing local commit with remote repo was refused: {}",
             local_with_redundant_repo
         );
-        let req_local_with_redundant = fetch_rx
-            .try_recv()
+        let req_local_with_redundant = db
+            .lock_pending_fetch()
+            .await
+            .unwrap()
             .expect("fetch request must be queued for local commit with redundant repo");
         assert_eq!(req_local_with_redundant.commit_hash, existing_sha_2);
         assert_eq!(
             req_local_with_redundant.repo_url, None,
             "effective_repo must be cleared to None when commit already exists locally"
         );
+        db.mark_fetch_done(req_local_with_redundant.id)
+            .await
+            .unwrap();
 
         // The token is an authority, not an identity, so it cannot act on a
         // bug however local its holder is.
@@ -3661,14 +3674,7 @@ mod tests {
         settings.server.testing_mode = true;
         let settings = Arc::new(settings);
         let (event_tx, _event_rx) = mpsc::channel(10);
-        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
-        let app = build_router(
-            settings,
-            db.clone(),
-            event_tx,
-            fetch_tx,
-            ServerOptions::default(),
-        );
+        let app = build_router(settings, db.clone(), event_tx, ServerOptions::default());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -3796,7 +3802,6 @@ mod tests {
 
         let settings = Arc::new(settings);
         let (event_tx, _event_rx) = mpsc::channel(10);
-        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
 
         // The capability assertions further down turn on this, since an
         // identity in the security list holds no capability of its own.
@@ -3806,7 +3811,6 @@ mod tests {
             settings.clone(),
             db.clone(),
             event_tx,
-            fetch_tx,
             ServerOptions {
                 dry_run: true,
                 local_token: Some(local_token.clone()),
@@ -4244,13 +4248,11 @@ mod tests {
 
         let settings = Arc::new(base_settings);
         let (event_tx, _event_rx) = mpsc::channel(10);
-        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
 
         let app = build_router(
             settings.clone(),
             db.clone(),
             event_tx.clone(),
-            fetch_tx.clone(),
             ServerOptions {
                 dry_run: true,
                 ..Default::default()
@@ -4440,7 +4442,6 @@ mod tests {
             settings: settings.clone(),
             db: db.clone(),
             sender: event_tx,
-            fetch_sender: fetch_tx,
             read_only: false,
             forge_registry: Arc::new(crate::forge::ForgeRegistry::new()),
             allow_all_submit: false,
@@ -4511,12 +4512,10 @@ mod tests {
         });
 
         let (event_tx, _event_rx) = mpsc::channel(10);
-        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
         let app = build_router(
             Arc::new(settings),
             db.clone(),
             event_tx,
-            fetch_tx,
             ServerOptions {
                 smtp_enabled: true,
                 ..Default::default()
@@ -4618,12 +4617,10 @@ mod tests {
         });
 
         let (event_tx, _event_rx) = mpsc::channel(10);
-        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
         let app = build_router(
             Arc::new(settings),
             db.clone(),
             event_tx,
-            fetch_tx,
             ServerOptions {
                 smtp_enabled: true,
                 ..Default::default()
@@ -4776,12 +4773,10 @@ mod tests {
             .push("blocklisted@example.com".to_string());
 
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(10);
-        let (fetch_tx, _fetch_rx) = tokio::sync::mpsc::channel(10);
         let app = build_router(
             Arc::new(settings),
             db.clone(),
             event_tx,
-            fetch_tx,
             ServerOptions {
                 smtp_enabled: true,
                 ..Default::default()
@@ -4936,12 +4931,10 @@ mod tests {
             .push("maintainer@example.org".to_string());
 
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(10);
-        let (fetch_tx, _fetch_rx) = tokio::sync::mpsc::channel(10);
         let app = build_router(
             Arc::new(settings),
             db.clone(),
             event_tx,
-            fetch_tx,
             ServerOptions {
                 smtp_enabled: true,
                 ..Default::default()
@@ -5005,12 +4998,10 @@ mod tests {
             // not a revocation.
             settings.server.acl.blocklist = vec![" Blocked@Example.ORG ".to_string()];
             let (event_tx, _event_rx) = mpsc::channel(10);
-            let (fetch_tx, _fetch_rx) = mpsc::channel(10);
             Arc::new(AppState {
                 settings: Arc::new(settings),
                 db: db.clone(),
                 sender: event_tx,
-                fetch_sender: fetch_tx,
                 read_only: false,
                 forge_registry: Arc::new(crate::forge::ForgeRegistry::new()),
                 allow_all_submit,
@@ -5072,12 +5063,10 @@ mod tests {
             let mut settings = crate::settings::Settings::new().unwrap();
             settings.server.testing_mode = false;
             let (event_tx, _event_rx) = mpsc::channel(10);
-            let (fetch_tx, _fetch_rx) = mpsc::channel(10);
             Arc::new(AppState {
                 settings: Arc::new(settings),
                 db: db.clone(),
                 sender: event_tx,
-                fetch_sender: fetch_tx,
                 read_only: false,
                 forge_registry: Arc::new(crate::forge::ForgeRegistry::new()),
                 allow_all_submit: false,
@@ -5221,12 +5210,10 @@ mod tests {
         }
         let settings = Arc::new(crate::settings::Settings::new().unwrap());
         let (sender, _) = mpsc::channel(1);
-        let (fetch_sender, _) = mpsc::channel(1);
         let state = Arc::new(AppState {
             settings,
             db,
             sender,
-            fetch_sender,
             read_only: false,
             allow_all_submit: false,
             smtp_enabled: false,
@@ -5479,12 +5466,10 @@ mod tests {
         let settings = Arc::new(settings);
 
         let (event_tx, _event_rx) = mpsc::channel(10);
-        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
         let app = build_router(
             settings.clone(),
             db.clone(),
             event_tx,
-            fetch_tx,
             ServerOptions {
                 dry_run: true,
                 ..Default::default()
@@ -5795,12 +5780,10 @@ F:	net/
         let hb = Arc::new(std::sync::atomic::AtomicI64::new(now));
 
         let (event_tx, _event_rx) = mpsc::channel(10);
-        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
         let app = build_router(
             settings,
             db,
             event_tx,
-            fetch_tx,
             ServerOptions {
                 smtp_enabled: true,
                 email_worker_heartbeat: Some(hb.clone()),
@@ -5958,11 +5941,9 @@ F:	*
         let acl = &settings.server.acl;
 
         let (event_tx, _event_rx) = mpsc::channel(10);
-        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
         let state = Arc::new(AppState {
             db: db.clone(),
             sender: event_tx,
-            fetch_sender: fetch_tx,
             settings: settings.clone(),
             read_only: false,
             allow_all_submit: false,
@@ -6298,16 +6279,11 @@ F:	*
         settings.forge.webhook_secret = None;
 
         let (event_tx, _event_rx) = mpsc::channel(10);
-        // Drop the fetch receiver deliberately to prove durability in fetch_queue
-        // does not depend on an in-memory channel send succeeding.
-        let (fetch_tx, fetch_rx) = mpsc::channel(1);
-        drop(fetch_rx);
 
         let state = Arc::new(AppState {
             settings: Arc::new(settings),
             db: db.clone(),
             sender: event_tx,
-            fetch_sender: fetch_tx,
             read_only: false,
             forge_registry: Arc::new(crate::forge::ForgeRegistry::new()),
             allow_all_submit: true,
@@ -6370,7 +6346,7 @@ F:	*
         assert_eq!(resp["status"], "accepted");
 
         let locked = db
-            .lock_pending_fetch_queue()
+            .lock_pending_fetch()
             .await
             .unwrap()
             .expect("fetch_queue row should be persisted");
@@ -6379,19 +6355,17 @@ F:	*
             Some("https://github.com/sashiko-dev/sashiko.git")
         );
         assert_eq!(
-            locked.commit_range,
+            locked.commit_hash,
             "1111111111111111111111111111111111111111..2222222222222222222222222222222222222222"
         );
         assert_eq!(
-            locked.article_id,
-            "mr-42-1111111111111111111111111111111111111111..2222222222222222222222222222222222222222"
+            locked.cover_letter_message_id.as_deref(),
+            Some(
+                "mr-42-1111111111111111111111111111111111111111..2222222222222222222222222222222222222222@sashiko.local"
+            )
         );
         assert_eq!(locked.mr_number, Some(42));
-        assert!(
-            db.mark_fetch_queue_done(locked.id, locked.locked_at)
-                .await
-                .unwrap()
-        );
+        db.mark_fetch_done(locked.id).await.unwrap();
 
         db.conn
             .execute(
@@ -6413,7 +6387,7 @@ F:	*
         .await
         .unwrap_or_else(|r| panic!("redelivery failed with status {}", r.status()));
         assert_eq!(resp2["status"], "accepted");
-        assert!(db.lock_pending_fetch_queue().await.unwrap().is_none());
+        assert!(db.lock_pending_fetch().await.unwrap().is_none());
     }
 }
 

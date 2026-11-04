@@ -900,22 +900,108 @@ async fn run_daemon(
     let (raw_tx, mut raw_rx) = mpsc::channel::<Event>(1000);
     let (parsed_tx, mut parsed_rx) = mpsc::channel::<ParsedArticle>(1000);
 
-    // Initialize FetchAgent
+    // Initialize the durable FetchWorker (DB-backed queue).
     let repo_path = std::path::PathBuf::from(&settings.git.repository_path);
-    let (fetch_agent, fetch_tx) = sashiko::fetcher::FetchAgent::new(
-        repo_path,
+    let fetch_worker = sashiko::fetcher::FetchWorker::new(
+        repo_path.clone(),
+        db.clone(),
         raw_tx.clone(),
         settings.forge.api_token.clone(),
-    );
-    let fetch_agent = Arc::new(fetch_agent.with_db(db.clone(), settings.review.max_retries));
+    )
+    .with_git_settings(&settings.git);
 
-    // Spawn FetchAgent under supervision so unexpected panics recover and drain fetch_queue
-    let fetch_handle = spawn_supervised_worker("FetchAgent", move || {
-        let agent = Arc::clone(&fetch_agent);
-        async move {
-            agent.run().await;
+    // Recover fetches orphaned before the durable queue existed or by a crash:
+    // re-enqueue any patchset stuck in 'Fetching' with no active queue row.
+    let mut seen_placeholder_ids = std::collections::HashSet::new();
+    loop {
+        match db.get_stuck_fetch_placeholders().await {
+            Ok(stuck) => {
+                if stuck.is_empty() {
+                    break;
+                }
+                let new_count = stuck
+                    .iter()
+                    .filter(|p| !seen_placeholder_ids.contains(&p.patchset_id))
+                    .count();
+                if new_count == 0 {
+                    error!(
+                        "Stuck fetch recovery made no forward progress on {} placeholder(s); aborting backfill loop to prevent startup hang",
+                        stuck.len()
+                    );
+                    break;
+                }
+                info!(
+                    "Backfilling {} orphaned fetch(es) into fetch_queue",
+                    stuck.len()
+                );
+                let count = stuck.len();
+                for p in stuck {
+                    seen_placeholder_ids.insert(p.patchset_id);
+                    let Some(cover) = p.cover_letter_message_id.as_deref() else {
+                        warn!(
+                            "Orphaned patchset {} has no cover_letter_message_id; marking Failed",
+                            p.patchset_id
+                        );
+                        if let Err(e) = db
+                            .conn
+                            .execute(
+                                "UPDATE patchsets SET status = 'Failed', failed_reason = ? WHERE id = ?",
+                                libsql::params![
+                                    "Missing cover_letter_message_id during startup recovery",
+                                    p.patchset_id
+                                ],
+                            )
+                            .await
+                        {
+                            error!("Failed to update orphan patchset status: {}", e);
+                        }
+                        continue;
+                    };
+                    let commit = sashiko::fetcher::commit_hash_from_placeholder(cover);
+                    let fetch_priority = if p.priority == sashiko::settings::DEFAULT_PRIORITY as i64
+                    {
+                        settings.git.fetch_priority_for_url(p.repo_url.as_deref())
+                    } else {
+                        p.priority as i32
+                    };
+                    if let Err(e) = db
+                        .enqueue_fetch(
+                            Some(p.patchset_id),
+                            Some(cover),
+                            p.repo_url.as_deref(),
+                            &commit,
+                            p.mr_url.as_deref(),
+                            p.mr_title.as_deref(),
+                            p.mr_number,
+                            fetch_priority,
+                        )
+                        .await
+                    {
+                        error!(
+                            "Failed to backfill fetch for patchset {}: {}",
+                            p.patchset_id, e
+                        );
+                        if let Err(err) = db
+                            .update_patchset_error(
+                                cover,
+                                &format!("Failed to enqueue fetch during startup recovery: {}", e),
+                            )
+                            .await
+                        {
+                            error!("Failed to update orphan patchset status: {}", err);
+                        }
+                    }
+                }
+                if count < 100 {
+                    break;
+                }
+            }
+            Err(e) => {
+                error!("Failed to query stuck fetch placeholders: {}", e);
+                break;
+            }
         }
-    });
+    }
 
     // Parser Dispatcher
     let semaphore = Arc::new(Semaphore::new(50));
@@ -1420,7 +1506,6 @@ async fn run_daemon(
     let api_settings = Arc::new(settings.clone());
     let api_db = db.clone();
     let api_tx = raw_tx.clone();
-    let api_fetch_tx = fetch_tx.clone();
     let local_token_path = settings.local_token_path();
     let local_token = publish_local_token(&local_token_path);
     let server_options = sashiko::server::ServerOptions {
@@ -1432,8 +1517,7 @@ async fn run_daemon(
     };
     let api_handle = tokio::spawn(async move {
         if let Err(e) =
-            sashiko::server::run_server(api_settings, api_db, api_tx, api_fetch_tx, server_options)
-                .await
+            sashiko::server::run_server(api_settings, api_db, api_tx, server_options).await
         {
             error!("Web API fatal error: {}", e);
         }
@@ -1485,10 +1569,7 @@ async fn run_daemon(
                 settings.forge.clone(),
                 settings.review.max_retries,
             )
-            .with_poller(
-                fetch_tx.clone(),
-                std::path::PathBuf::from(&settings.git.repository_path),
-            ),
+            .with_poller(std::path::PathBuf::from(&settings.git.repository_path)),
         );
         let outbox_worker = Arc::clone(&forge_worker);
         let outbox_handle = spawn_supervised_worker("ForgeWorker", move || {
@@ -1588,13 +1669,18 @@ async fn run_daemon(
                 remote.name,
                 sashiko::utils::redact_secret(&remote.url)
             );
-            if let Err(e) =
-                sashiko::git_ops::ensure_remote(&repo_path, &remote.name, &remote.url, false).await
+            if let Err(e) = sashiko::git_ops::ensure_custom_remote(&repo_path, remote, false).await
             {
                 error!("Failed to ensure custom remote {}: {}", remote.name, e);
             }
         }
     }
+
+    // Spawn the FetchWorker after custom remotes and their tracking refs are
+    // initialized so the first claimed fetches have negotiation tips ready.
+    let fetch_handle = tokio::spawn(async move {
+        fetch_worker.run().await;
+    });
 
     // Start Git Sync Worker
     let sync_handle = {

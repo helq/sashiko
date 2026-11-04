@@ -13,13 +13,12 @@
 // limitations under the License.
 
 use crate::db::Database;
-use crate::fetcher::FetchRequest;
 use crate::settings::ForgeSettings;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
@@ -32,7 +31,7 @@ pub struct ForgeWorker {
     settings: ForgeSettings,
     max_retries: u32,
     cached_token: Mutex<Option<(String, i64)>>,
-    fetch_sender: Option<mpsc::Sender<FetchRequest>>,
+    poller_enabled: bool,
     repo_path: Option<PathBuf>,
     api_base: String,
 }
@@ -44,18 +43,14 @@ impl ForgeWorker {
             settings,
             max_retries,
             cached_token: Mutex::new(None),
-            fetch_sender: None,
+            poller_enabled: false,
             repo_path: None,
             api_base: GITHUB_API_BASE.to_string(),
         }
     }
 
-    pub fn with_poller(
-        mut self,
-        fetch_sender: mpsc::Sender<FetchRequest>,
-        repo_path: PathBuf,
-    ) -> Self {
-        self.fetch_sender = Some(fetch_sender);
+    pub fn with_poller(mut self, repo_path: PathBuf) -> Self {
+        self.poller_enabled = true;
         self.repo_path = Some(repo_path);
         self
     }
@@ -209,9 +204,9 @@ impl ForgeWorker {
     }
 
     pub async fn poll_github_repos_once(&self, client: &reqwest::Client) -> usize {
-        let Some(ref fetch_sender) = self.fetch_sender else {
+        if !self.poller_enabled {
             return 0;
-        };
+        }
         let repos = self.resolve_polled_github_repos().await;
         if repos.is_empty() {
             return 0;
@@ -335,9 +330,9 @@ impl ForgeWorker {
                     let head_short = &pr.metadata.head_sha[..8.min(pr.metadata.head_sha.len())];
                     match crate::server::ingest_forge_pull_request(
                         &self.db,
-                        fetch_sender,
                         "GitHub",
                         pr.metadata.clone(),
+                        crate::settings::DEFAULT_PRIORITY,
                     )
                     .await
                     {
@@ -635,9 +630,8 @@ mod tests {
         settings.forge.api_token = Some("stale-token".to_string());
         settings.forge.repos = vec!["sashiko-dev/sashiko".to_string()];
 
-        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
         let worker = ForgeWorker::new(db.clone(), settings.forge.clone(), 3)
-            .with_poller(fetch_tx, PathBuf::from("."))
+            .with_poller(PathBuf::from("."))
             .with_api_base(format!("http://{}", addr));
 
         let client = crate::worker::outbox_client().unwrap();
@@ -647,9 +641,9 @@ mod tests {
         let count1 = worker.poll_github_repos_once(&client).await;
         assert_eq!(count1, 2);
 
-        let f1 = db.lock_pending_fetch_queue().await.unwrap().unwrap();
+        let f1 = db.lock_pending_fetch().await.unwrap().unwrap();
         assert_eq!(f1.mr_number, Some(735));
-        db.mark_fetch_queue_done(f1.id, f1.locked_at).await.unwrap();
+        db.mark_fetch_done(f1.id).await.unwrap();
         db.conn
             .execute(
                 "UPDATE patchsets SET status = 'Reviewed' WHERE mr_number = 735",
@@ -658,9 +652,9 @@ mod tests {
             .await
             .unwrap();
 
-        let f2 = db.lock_pending_fetch_queue().await.unwrap().unwrap();
+        let f2 = db.lock_pending_fetch().await.unwrap().unwrap();
         assert_eq!(f2.mr_number, Some(736));
-        db.mark_fetch_queue_done(f2.id, f2.locked_at).await.unwrap();
+        db.mark_fetch_done(f2.id).await.unwrap();
         db.conn
             .execute(
                 "UPDATE patchsets SET status = 'Reviewed' WHERE mr_number = 736",
@@ -689,7 +683,7 @@ mod tests {
         ]);
         let count2 = worker.poll_github_repos_once(&client).await;
         assert_eq!(count2, 0);
-        assert!(db.lock_pending_fetch_queue().await.unwrap().is_none());
+        assert!(db.lock_pending_fetch().await.unwrap().is_none());
 
         // 3. Force-pushing a new head_sha (head2) on #735 queues a [v2] review.
         let v2_rfc3339 = (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
@@ -710,9 +704,9 @@ mod tests {
         ]);
         let count3 = worker.poll_github_repos_once(&client).await;
         assert_eq!(count3, 1);
-        let f3 = db.lock_pending_fetch_queue().await.unwrap().unwrap();
+        let f3 = db.lock_pending_fetch().await.unwrap().unwrap();
         assert_eq!(f3.mr_number, Some(735));
-        assert_eq!(f3.commit_range, format!("{base2}..{head2}"));
+        assert_eq!(f3.commit_hash, format!("{base2}..{head2}"));
 
         let mut rows = db
             .conn
@@ -728,7 +722,7 @@ mod tests {
             "unexpected subject: {latest_subject}"
         );
         drop(rows);
-        db.mark_fetch_queue_done(f3.id, f3.locked_at).await.unwrap();
+        db.mark_fetch_done(f3.id).await.unwrap();
         db.conn
             .execute(
                 "UPDATE patchsets SET status = 'Reviewed' WHERE id = (SELECT MAX(id) FROM patchsets WHERE mr_number = 735)",

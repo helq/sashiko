@@ -2,7 +2,7 @@ CREATE TABLE IF NOT EXISTS fetch_queue (
     id INTEGER PRIMARY KEY,
     patchset_id INTEGER,
     cover_letter_message_id TEXT,
-    repo_url TEXT NOT NULL DEFAULT '',
+    repo_url TEXT,
     commit_hash TEXT NOT NULL DEFAULT '',
     commit_range TEXT NOT NULL DEFAULT '',
     article_id TEXT,
